@@ -490,9 +490,9 @@ struct AsyncCopy {
 };
 
 class Transport {
+ public:
   Transport();
   ~Transport();
-
   void SendPushResponse(Message &msg) {
 
   }
@@ -501,16 +501,23 @@ class Transport {
 
   }
 
-  void Recv(Message &msg);
+  void SendControlMessage(Message &msg) {
+
+  }
+  
+  void Recv(Message *msg);
   void SendPushRequest();
   void SendPullResponse();
 };
 
 
 class RDMATransport : public Transport {
+ public:
   RDMATransport() {
 
   }
+
+  ~RDMATransport();
 
   void SendPushRequest(Message &msg) override {
 
@@ -520,15 +527,43 @@ class RDMATransport : public Transport {
 
   }
 
-  void Recv(Message &msg) override {
+  // get remote address using SEND/RECV
+  void GetRemoteAddr() { 
 
   }
+
+  // register RDMA memory
+  void RegisterMemory(Message &msg) {
+    for (auto& sa : msg.data) {
+      if (!sa.size()) continue;
+      CHECK(sa.data());
+      std::lock_guard<std::mutex> lock(map_mu_);
+      if (memory_mr_map_.find(sa.data()) == memory_mr_map_.end()) {
+        struct ibv_mr *temp_mr;
+        CHECK (temp_mr = ibv_reg_mr(pd_, sa.data(), sa.size(),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
+            << "Failed to register the memory region: " << strerror(errno)
+            << ", sa.size()=" << sa.size();
+        memory_mr_map_[sa.data()] = temp_mr;
+      }
+    }
+  }
+
+  void Recv(Message *msg) override {
+
+  }
+
+ private:
+
 };
 
 class IPCTransport : public Transport {
+ public:
   IPCTransport() {
 
   }
+
+  ~IPCTransport();
 
   void SendPushRequest(Message &msg) override {
     
@@ -538,7 +573,7 @@ class IPCTransport : public Transport {
 
   }
 
-  void Recv(Message &msg) override {
+  void Recv(Message *msg) override {
 
   }
 };
@@ -620,11 +655,7 @@ class RDMAVan : public Van {
     PS_VLOG(1) << "Clearing mempool.";
     mempool_.reset();
 
-    auto map_iter = memory_mr_map.begin();
-    while (map_iter != memory_mr_map.end()) {
-      ibv_dereg_mr(map_iter->second);
-      map_iter++;
-    }
+    for (auto& it : memory_mr_map_) ibv_dereg_mr(it.second);
 
     PS_VLOG(1) << "Clearing endpoints.";
     incoming_.clear();
@@ -860,7 +891,7 @@ class RDMAVan : public Van {
       if (m.shutdown) break;
       if (m.len == 0) continue;
 
-      // TODO: use parallel copy      
+      // TODO: use parallel copy
       CHECK(m.dst);
       CHECK(m.src);
       memcpy(m.dst, m.src, m.len);
@@ -885,82 +916,22 @@ class RDMAVan : public Van {
     int remote_id = msg.meta.recver;
     CHECK_NE(remote_id, Meta::kEmpty);
 
-    // register RDMA memory
-    for (auto& sa : msg.data) {
-      if (sa.size()) {
-        std::lock_guard<std::mutex> lock(map_mu_);
-        auto search_map_iterator = memory_mr_map.find(sa.data());
-        if (search_map_iterator == memory_mr_map.end()) {
-          struct ibv_mr *temp_mr;
-          CHECK(sa.data()) << "address empty";
-          CHECK (temp_mr = ibv_reg_mr(pd_, sa.data(), sa.size(),
-                 IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
-                  << "Failed to register the memory region: "
-                  << strerror(errno)
-                  << ", sa.size()=" << sa.size();
-          memory_mr_map[sa.data()] = temp_mr;
-        }
-      }
-    }
-
-    // init for inplace push_pull
-    if (IsValidPushpull(msg)) {
-      if (!is_server_) { // worker
-        std::lock_guard<std::mutex> lock(map_mu_);
-        uint64_t key = DecodeKey(msg.data[0]);
-        msg.meta.key = key;
-
-        if (msg.meta.push && msg.meta.request) { // push request
-          CHECK_EQ(msg.data.size(), 3) << msg.data.size();
-          CHECK_NE(memory_mr_map.find(msg.data[1].data()), memory_mr_map.end());
-
-          auto& vals = msg.data[1];
-          msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
-          msg.meta.val_len = vals.size();
-          msg.meta.option = memory_mr_map[vals.data()]->rkey;
-        }
-      }
-      if (!msg.meta.push && !msg.meta.request) { // server, pull response
-        CHECK(is_server_);
-        CHECK_EQ(msg.data.size(), 3) << msg.data.size();
-
-        std::lock_guard<std::mutex> lock(map_mu_);
-        uint64_t key = msg.meta.key;
-        auto recver = msg.meta.recver;
-
-        CHECK_NE(key_meta_map_.find(key), key_meta_map_.end())
-            << "key=" << key << " not inited in key_meta_map";
-        CHECK_NE(key_meta_map_[key].find(recver), key_meta_map_[key].end())
-            << "key=" << key << ", recver=" << recver << " not inited in key_meta_map[key]";
-
-        msg.meta.val_len = std::get<0>(key_meta_map_[key][recver]);
-        msg.meta.addr = std::get<1>(key_meta_map_[key][recver]);
-        msg.meta.option = std::get<2>(key_meta_map_[key][recver]);
-      }
-    }
-
     PBMeta meta;
     PackMetaPB(msg.meta, &meta);
     CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
     Endpoint *endpoint = endpoints_[remote_id].get();
     MessageBuffer *msg_buf = new MessageBuffer();
-
+    
     size_t meta_len = meta.ByteSize();
     size_t data_len = msg.meta.data_size;
     size_t total_len = meta_len + data_len;
     CHECK(meta_len);
 
     // prepare memory
-    if (msg.meta.simple_app || !msg.meta.control.empty()){ // simple_app or control message
+    if (!IsValidPushpull(msg)) { // simple_app or control message
       msg_buf->inline_len = total_len;
       msg_buf->inline_buf = mempool_->Alloc(total_len);
       meta.SerializeToArray(msg_buf->inline_buf, meta_len);
-      char *cur = msg_buf->inline_buf + meta_len;
-      for (auto &sa : msg.data) {
-        size_t seg_len = sa.size();
-        memcpy(cur, sa.data(), seg_len);
-        cur += seg_len;
-      }
     } else { // data message
       msg_buf->inline_len = meta_len;
       msg_buf->inline_buf = mempool_->Alloc(meta_len);
@@ -968,20 +939,58 @@ class RDMAVan : public Van {
       meta.SerializeToArray(msg_buf->inline_buf, meta_len);
       if (!is_server_ && !is_local_[remote_id]) { // worker, send to non-local servers
         for (auto &sa : msg_buf->data) {
-          if (sa.size()) {
-            auto search_map_iterator = memory_mr_map.find(sa.data());
-            CHECK_NE(search_map_iterator, memory_mr_map.end()) << "not registered memory region";
-            MRPtr ptr(search_map_iterator->second, [](struct ibv_mr *mr) {});
-            CHECK(ptr.get()) << strerror(errno);
-            msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
-          }
+          if (!sa.size()) continue;
+          auto search_map_iterator = memory_mr_map_.find(sa.data());
+          CHECK_NE(search_map_iterator, memory_mr_map_.end()) << "not registered memory region";
+          MRPtr ptr(search_map_iterator->second, [](struct ibv_mr *mr) {});
+          CHECK(ptr.get()) << strerror(errno);
+          msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
         }
       }
     }
 
-    // server send pull response (vals) with RDMA-write / IPC
-    if (is_server_ && IsValidPushpull(msg) &&
-          !msg.meta.push && !msg.meta.request) { 
+    auto trans = reinterpret_cast<Transport*>(is_local_[remote_id] ? ipc_trans_ : rdma_trans_);
+    if (!IsValidPushpull(msg)) { // control message
+      msg_buf->inline_len = total_len;
+      msg_buf->inline_buf = mempool_->Alloc(total_len);
+      meta.SerializeToArray(msg_buf->inline_buf, meta_len);
+      trans->SendControlMessage();
+    } else if (msg.meta.push && msg.meta.request) { // worker, push request
+      std::lock_guard<std::mutex> lock(map_mu_);
+      uint64_t key = DecodeKey(msg.data[0]);
+      msg.meta.key = key;
+
+      CHECK_EQ(msg.data.size(), 3) << msg.data.size();
+      CHECK_NE(memory_mr_map_.find(msg.data[1].data()), memory_mr_map_.end());
+
+      auto& vals = msg.data[1];
+      msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
+      msg.meta.val_len = vals.size();
+      msg.meta.option = memory_mr_map_[vals.data()]->rkey;
+
+      trans->SendPushRequest();
+    } else if (msg.meta.push && !msg.meta.request) { // server, push response
+      trans->SendPushResponse();
+    } else if (!msg.meta.push && msg.meta.request) { // worker, pull request
+      trans->SendPullRequest();
+    } else if (!msg.meta.push && !msg.meta.request) { // server, pull response
+      CHECK(is_server_);
+      CHECK_EQ(msg.data.size(), 3) << msg.data.size();
+
+      std::lock_guard<std::mutex> lock(map_mu_);
+      uint64_t key = msg.meta.key;
+      auto recver = msg.meta.recver;
+
+      CHECK_NE(key_meta_map_.find(key), key_meta_map_.end())
+          << "key=" << key << " not inited in key_meta_map";
+      CHECK_NE(key_meta_map_[key].find(recver), key_meta_map_[key].end())
+          << "key=" << key << ", recver=" << recver << " not inited in key_meta_map[key]";
+
+      msg.meta.val_len = std::get<0>(key_meta_map_[key][recver]);
+      msg.meta.addr = std::get<1>(key_meta_map_[key][recver]);
+      msg.meta.option = std::get<2>(key_meta_map_[key][recver]);
+
+      // RDMA write or IPC
       std::lock_guard<std::mutex> lock(map_mu_);
       auto key = msg.meta.key;
       auto recver = msg.meta.recver;
@@ -1002,7 +1011,6 @@ class RDMAVan : public Van {
         auto addr = (void*) msg_buf->data[1].data();
         CHECK(addr);
         void* shm_addr = GetSharedMemory(kShmPrefix, key);
-        
         // async copy
         AsyncCopy m = {endpoint, msg_buf, shm_addr, addr, len, meta_len, false};
         auto cnt = cpy_counter_.fetch_add(1);
@@ -1013,8 +1021,8 @@ class RDMAVan : public Van {
         auto raddr = std::get<1>(key_meta_map_[key][recver]);
         auto rkey = std::get<2>(key_meta_map_[key][recver]);
 
-        auto temp_mr = memory_mr_map.find(msg_buf->data[1].data());
-        CHECK_NE(temp_mr, memory_mr_map.end());
+        auto temp_mr = memory_mr_map_.find(msg_buf->data[1].data());
+        CHECK_NE(temp_mr, memory_mr_map_.end());
 
         struct ibv_sge sge;
         sge.addr = reinterpret_cast<uint64_t>(msg_buf->data[1].data());
@@ -1037,6 +1045,10 @@ class RDMAVan : public Van {
         CHECK_EQ(ibv_post_send(endpoint->cm_id->qp, &wr, &bad_wr), 0)
           << "ibv_post_send failed.";
       }
+
+      trans->SendPullResponse();
+    } else {
+      CHECK(0) << "unexpected message type";
     }
 
     WRContext *context = nullptr, *reserved = nullptr;
@@ -1055,8 +1067,6 @@ class RDMAVan : public Van {
     if (!is_server_ && is_local_[remote_id] && IsValidPushpull(msg)) { 
       // local IPC with shared memory
       req->data_num = 0;
-      auto key = DecodeKey(msg.data[0]);
-      CHECK_EQ(key, msg.meta.key);
     } else { 
       // normal RDMA
       req->data_num = msg.data.size();
@@ -1577,6 +1587,9 @@ class RDMAVan : public Van {
   AddressPool<BufferContext> addr_pool_;
   std::unique_ptr<SimpleMempool> mempool_;
 
+  std::unique_ptr<RDMATransport> rdma_trans_;
+  std::unique_ptr<IPCTransport> ipc_trans_;
+
   struct rdma_cm_id *listener_ = nullptr;
   std::atomic<bool> should_stop_;
 
@@ -1586,7 +1599,7 @@ class RDMAVan : public Van {
   struct rdma_event_channel *event_channel_ = nullptr;
   struct ibv_context *context_ = nullptr;
 
-  std::unordered_map<char *, struct ibv_mr *> memory_mr_map;
+  std::unordered_map<char *, struct ibv_mr *> memory_mr_map_;
 
   // ibverbs protection domain
   struct ibv_pd *pd_ = nullptr;

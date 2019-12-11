@@ -906,7 +906,7 @@ class RDMAVan : public Van {
 
     int meta_len;
     char* meta_buf = nullptr;
-    PackMeta(msg.meta, &meta_buf, &meta_size);
+    PackMeta(msg.meta, &meta_buf, &meta_len);
 
     CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
     Endpoint *endpoint = endpoints_[remote_id].get();

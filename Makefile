@@ -20,10 +20,10 @@ endif
 
 INCPATH = -I./src -I./include -I$(DEPS_PATH)/include
 CFLAGS = -std=c++14 -msse2 -fPIC -O3 -ggdb -Wall -finline-functions $(INCPATH) $(ADD_CFLAGS)
-LIBS = -pthread
+LIBS = -pthread -lrt
 
 ifeq ($(USE_RDMA), 1)
-LIBS += -lrdmacm -libverbs -lrt
+LIBS += -lrdmacm -libverbs
 CFLAGS += -DDMLC_USE_RDMA
 endif
 

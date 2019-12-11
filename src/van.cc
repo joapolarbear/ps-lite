@@ -494,41 +494,6 @@ void Van::Receiving() {
   }
 }
 
-void Van::PackMetaPB(const Meta &meta, PBMeta *pb) {
-  pb->set_head(meta.head);
-  if (meta.app_id != Meta::kEmpty) pb->set_app_id(meta.app_id);
-  if (meta.timestamp != Meta::kEmpty) pb->set_timestamp(meta.timestamp);
-  if (meta.body.size()) pb->set_body(meta.body);
-  pb->set_push(meta.push);
-  pb->set_request(meta.request);
-  pb->set_simple_app(meta.simple_app);
-  pb->set_customer_id(meta.customer_id);
-  for (auto d : meta.data_type) pb->add_data_type(d);
-  if (!meta.control.empty()) {
-    auto ctrl = pb->mutable_control();
-    ctrl->set_cmd(meta.control.cmd);
-    if (meta.control.cmd == Control::BARRIER) {
-      ctrl->set_barrier_group(meta.control.barrier_group);
-    } else if (meta.control.cmd == Control::ACK) {
-      ctrl->set_msg_sig(meta.control.msg_sig);
-    }
-    for (const auto &n : meta.control.node) {
-      auto p = ctrl->add_node();
-      p->set_id(n.id);
-      p->set_role(n.role);
-      p->set_port(n.port);
-      p->set_hostname(n.hostname);
-      p->set_is_recovery(n.is_recovery);
-      p->set_customer_id(n.customer_id);
-    }
-  }
-  pb->set_data_size(meta.data_size);
-  pb->set_key(meta.key);
-  pb->set_addr(meta.addr);
-  pb->set_val_len(meta.val_len);
-  pb->set_option(meta.option);
-}
-
 void Van::PackMeta(const Meta &meta, char **meta_buf, int *buf_size) {
   // convert into protobuf
   PBMeta pb;

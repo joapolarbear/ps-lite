@@ -112,11 +112,6 @@ class Van {
   void PackMeta(const Meta &meta, char **meta_buf, int *buf_size);
 
   /**
-   * \brief pack meta into protobuf
-   */
-  void PackMetaPB(const Meta &meta, PBMeta *pb);
-
-  /**
    * \brief unpack meta from a string
    */
   void UnpackMeta(const char *meta_buf, int buf_size, Meta *meta);

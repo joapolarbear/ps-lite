@@ -489,6 +489,60 @@ struct AsyncCopy {
   bool shutdown;
 };
 
+class Transport {
+  Transport();
+  ~Transport();
+
+  void SendPushResponse(Message &msg) {
+
+  }
+
+  void SendPullRequest(Message &msg) {
+
+  }
+
+  void Recv(Message &msg);
+  void SendPushRequest();
+  void SendPullResponse();
+};
+
+
+class RDMATransport : public Transport {
+  RDMATransport() {
+
+  }
+
+  void SendPushRequest(Message &msg) override {
+
+  }
+
+  void SendPullResponse(Message &msg) override {
+
+  }
+
+  void Recv(Message &msg) override {
+
+  }
+};
+
+class IPCTransport : public Transport {
+  IPCTransport() {
+
+  }
+
+  void SendPushRequest(Message &msg) override {
+    
+  }
+
+  void SendPullResponse(Message &msg) override {
+
+  }
+
+  void Recv(Message &msg) override {
+
+  }
+};
+
 class RDMAVan : public Van {
  public:
   RDMAVan() {
@@ -506,11 +560,6 @@ class RDMAVan : public Van {
     is_server_ = role=="server";
     if (is_server_) LOG(INFO) << "This is server";
     else LOG(INFO) << "This is " << ((role=="worker") ? "worker" : "scheduler");
-
-    val = Environment::Get()->find("ENABLE_RDMA_LOG");
-    enable_rdma_log_ = val? atoi(val) : false;
-    if (enable_rdma_log_) LOG(INFO) << "Enable RDMA logging";
-    else LOG(INFO) << "You can enable RDMA logging with ENABLE_RDMA_LOG=1";
 
     val = Environment::Get()->find("BYTEPS_ENABLE_IPC");
     disable_ipc_ = val ? !atoi(val) : true;
@@ -836,6 +885,7 @@ class RDMAVan : public Van {
     int remote_id = msg.meta.recver;
     CHECK_NE(remote_id, Meta::kEmpty);
 
+    // register RDMA memory
     for (auto& sa : msg.data) {
       if (sa.size()) {
         std::lock_guard<std::mutex> lock(map_mu_);
@@ -868,14 +918,6 @@ class RDMAVan : public Van {
           msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
           msg.meta.val_len = vals.size();
           msg.meta.option = memory_mr_map[vals.data()]->rkey;
-
-          if (enable_rdma_log_) {
-            LOG(INFO) << "send push key=" << key
-                    << ", val_len=" << msg.meta.val_len
-                    << ", recver=" << msg.meta.recver
-                    << ", val_addr=" << msg.meta.addr
-                    << ", rkey=" << msg.meta.option;
-          }
         }
       }
       if (!msg.meta.push && !msg.meta.request) { // server, pull response
@@ -894,13 +936,6 @@ class RDMAVan : public Van {
         msg.meta.val_len = std::get<0>(key_meta_map_[key][recver]);
         msg.meta.addr = std::get<1>(key_meta_map_[key][recver]);
         msg.meta.option = std::get<2>(key_meta_map_[key][recver]);
-
-        if (enable_rdma_log_) {
-          LOG(INFO) << "send pull response key=" << key
-                  << ", val_len=" << msg.meta.val_len
-                  << ", val_addr=" << msg.meta.addr
-                  << ", rkey=" << msg.meta.option;
-        }
       }
     }
 
@@ -1151,25 +1186,11 @@ class RDMAVan : public Van {
       std::lock_guard<std::mutex> lock(map_mu_);
       if (key_meta_map_.find(key) == key_meta_map_.end()
             || key_meta_map_[key].find(sender) == key_meta_map_[key].end()) {
-        if (enable_rdma_log_) {
-          LOG(INFO) << "(init) recv key=" << key
-                  << ", len=" << len
-                  << ", sender=" << msg->meta.sender
-                  << ", val_addr=" << addr
-                  << ", rkey=" << rkey;
-        }
         key_meta_map_[key][sender] = std::make_tuple(len, addr, rkey);
       } else {
         CHECK_EQ(len, std::get<0>(key_meta_map_[key][sender]));
         CHECK_EQ(addr, std::get<1>(key_meta_map_[key][sender]));
         CHECK_EQ(rkey, std::get<2>(key_meta_map_[key][sender]));
-
-        if (enable_rdma_log_) {
-          LOG(INFO) << "recv push key=" << key
-                  << ", len=" << len
-                  << ", val_addr=" << addr
-                  << ", rkey=" << rkey;
-        }
       }
     }
 

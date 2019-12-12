@@ -9,7 +9,34 @@
 
 #ifdef DMLC_USE_RDMA
 
-#include "transport.h"
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/shm.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <unistd.h>
+#include <netdb.h>
+#include <poll.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <rdma/rdma_cma.h>
+
+#include <algorithm>
+#include <map>
+#include <queue>
+#include <set>
+#include <string>
+#include <thread>
+#include <tuple>
+#include <unordered_map>
+#include <vector>
+
+#include "ps/internal/threadsafe_queue.h"
+#include "ps/internal/van.h"
+
 
 namespace ps {
 
@@ -469,6 +496,203 @@ struct AsyncCopy {
   bool shutdown;
 };
 
+
+class Transport {
+ public:
+  explicit Transport(Endpoint *endpoint) {
+    endpoint_ = endpoint;
+  };
+
+  ~Transport();
+
+  void SendPushResponse(MessageBuffer *msg_buf) {
+    
+  }
+
+  void SendPullRequest(MessageBuffer *msg_buf) {
+
+  }
+
+  void SendControlMessage(MessageBuffer *msg_buf) {
+    if (no remote address) {
+      Rendezvous and get address;
+    }
+    RDMAWriteWithImm(msg_buf);
+  }
+
+  void RDMAWriteWithImm(MessageBuffer *msg_buf) {
+    struct ibv_sge sge[1 + msg_buf->mrs.size()];
+    sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
+    sge[0].length = msg_buf->inline_len;
+    sge[0].lkey = mempool_->LocalKey(msg_buf->inline_buf);
+
+    size_t num_sge = 1;
+    for (auto &pair : msg_buf->mrs) {
+      size_t length = pair.second;
+      CHECK(length);
+      sge[num_sge].addr =
+          reinterpret_cast<uint64_t>(pair.first->addr);
+      sge[num_sge].length = length;
+      sge[num_sge].lkey = pair.first->lkey;
+      ++num_sge;
+    }
+    if (is_server_) CHECK_EQ(num_sge, 1) << num_sge;
+
+    WRContext *write_ctx = msg_buf->reserved_context;
+
+    MessageBuffer **tmp =
+        reinterpret_cast<MessageBuffer **>(write_ctx->buffer->addr);
+    *tmp = msg_buf;  // write the addr of msg_buf into the mr buffer
+
+    struct ibv_send_wr wr, *bad_wr = nullptr;
+    memset(&wr, 0, sizeof(wr));
+
+    wr.wr_id = reinterpret_cast<uint64_t>(write_ctx);
+    wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+    wr.next = nullptr;
+
+    wr.imm_data = idx;
+
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.sg_list = sge;
+    wr.num_sge = num_sge;
+
+    wr.wr.rdma.remote_addr = remote_addr;
+    wr.wr.rdma.rkey = rkey;
+
+    CHECK_EQ(ibv_post_send(endpoint->cm_id->qp, &wr, &bad_wr), 0)
+        << "ibv_post_send failed.";
+  }
+  
+  void Recv(Message *msg);
+  void SendPushRequest(MessageBuffer *msg_buf);
+  void SendPullResponse(MessageBuffer *msg_buf);
+
+  Endpoint *endpoint_;
+}; // class Transport
+
+
+
+class RDMATransport : public Transport {
+ public:
+  void SendPushRequest(MessageBuffer *msg_buf) override {
+    std::lock_guard<std::mutex> lock(map_mu_);
+    uint64_t key = DecodeKey(msg.data[0]);
+    msg.meta.key = key;
+
+    CHECK_EQ(msg.data.size(), 3) << msg.data.size();
+    CHECK_NE(memory_mr_map_.find(msg.data[1].data()), memory_mr_map_.end());
+
+    auto& vals = msg.data[1];
+    msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
+    msg.meta.val_len = vals.size();
+    msg.meta.option = memory_mr_map_[vals.data()]->rkey;
+  }
+
+  void SendPullResponse(MessageBuffer *msg_buf) override {
+    std::lock_guard<std::mutex> lock(map_mu_);
+    uint64_t key = msg.meta.key;
+    auto recver = msg.meta.recver;
+
+    CHECK_NE(key_meta_map_.find(key), key_meta_map_.end())
+        << "key=" << key << " not inited in key_meta_map";
+    CHECK_NE(key_meta_map_[key].find(recver), key_meta_map_[key].end())
+        << "key=" << key << ", recver=" << recver << " not inited in key_meta_map[key]";
+
+    msg.meta.val_len = std::get<0>(key_meta_map_[key][recver]);
+    msg.meta.addr = std::get<1>(key_meta_map_[key][recver]);
+    msg.meta.option = std::get<2>(key_meta_map_[key][recver]);
+
+    // RDMA write
+    auto raddr = std::get<1>(key_meta_map_[key][recver]);
+    auto rkey = std::get<2>(key_meta_map_[key][recver]);
+
+    auto temp_mr = memory_mr_map_.find(msg_buf->data[1].data());
+    CHECK_NE(temp_mr, memory_mr_map_.end());
+
+    struct ibv_sge sge;
+    sge.addr = reinterpret_cast<uint64_t>(msg_buf->data[1].data());
+    sge.length = msg_buf->data[1].size();
+    sge.lkey = temp_mr->second->lkey;
+
+    struct ibv_send_wr wr, *bad_wr = nullptr;
+    memset(&wr, 0, sizeof(wr));
+
+    wr.wr_id = reinterpret_cast<uint64_t>(raddr);
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.next = nullptr;
+    // wr.send_flags = IBV_SEND_SIGNALED;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    wr.wr.rdma.remote_addr = raddr;
+    wr.wr.rdma.rkey = rkey;
+
+    CHECK_EQ(ibv_post_send(endpoint->cm_id->qp, &wr, &bad_wr), 0)
+      << "ibv_post_send failed.";
+  }
+
+  // get remote address using SEND/RECV
+  void GetRemoteAddr() { 
+
+  }
+
+  // register RDMA memory
+  void RegisterMemory(Message &msg) {
+    for (auto& sa : msg.data) {
+      if (!sa.size()) continue;
+      CHECK(sa.data());
+      std::lock_guard<std::mutex> lock(map_mu_);
+      if (memory_mr_map_.find(sa.data()) == memory_mr_map_.end()) {
+        struct ibv_mr *temp_mr;
+        CHECK (temp_mr = ibv_reg_mr(pd_, sa.data(), sa.size(),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
+            << "Failed to register the memory region: " << strerror(errno)
+            << ", sa.size()=" << sa.size();
+        memory_mr_map_[sa.data()] = temp_mr;
+      }
+    }
+  }
+
+  void Recv(Message *msg) override {
+
+  }
+
+ private:
+
+}; // class RDMATransport
+
+
+class IPCTransport : public Transport {
+ public:
+
+  void SendPushRequest(Message &msg) override {
+    
+  }
+
+  void SendPullResponse(Message &msg) override {
+    std::lock_guard<std::mutex> lock(map_mu_);
+    auto key = msg.meta.key;
+    auto recver = msg.meta.recver;
+    auto len = std::get<0>(key_meta_map_[key][recver]);
+
+    // IPC
+    auto addr = (void*) msg_buf->data[1].data();
+    CHECK(addr);
+    void* shm_addr = GetSharedMemory(kShmPrefix, key);
+    // async copy
+    AsyncCopy m = {endpoint, msg_buf, shm_addr, addr, len, meta_len, false};
+    auto cnt = cpy_counter_.fetch_add(1);
+    async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
+  }
+
+  void Recv(Message *msg) override {
+
+  } 
+}; // class IPCTransport
+
+
+
 class RDMAVan : public Van {
  public:
   RDMAVan() {
@@ -639,7 +863,8 @@ class RDMAVan : public Van {
 
       endpoint->SetNodeID(node.id);
 
-      Transport* t = is_local_[node.id] ? std::make_unique<IPCTransport>() : std::make_unique<RDMATransport>();
+      Transport *t = is_local_[node.id] ? 
+          std::make_unique<IPCTransport>(endpoint) : std::make_unique<RDMATransport>(endpoint);
       endpoint->SetTransport(t);
 
       struct addrinfo *remote_addr;
@@ -839,19 +1064,19 @@ class RDMAVan : public Van {
     auto trans = endpoint.GetTransport();
     if (!IsValidPushpull(msg)) { 
       // control message
-      trans->SendControlMessage(endpoint, msg_buf);
+      trans->SendControlMessage(msg_buf);
     } else if (msg.meta.push && msg.meta.request) { 
       // worker, push request
-      trans->SendPushRequest(endpoint, msg_buf);
+      trans->SendPushRequest(msg_buf);
     } else if (msg.meta.push && !msg.meta.request) { 
       // server, push response
-      trans->SendPushResponse(endpoint, msg_buf);
+      trans->SendPushResponse(msg_buf);
     } else if (!msg.meta.push && msg.meta.request) { 
       // worker, pull request
-      trans->SendPullRequest(endpoint, msg_buf);
+      trans->SendPullRequest(msg_buf);
     } else if (!msg.meta.push && !msg.meta.request) { 
       // server, pull response
-      trans->SendPullResponse(endpoint, msg_buf);
+      trans->SendPullResponse(msg_buf);
     } else {
       CHECK(0) << "unexpected message type";
     }
@@ -1425,7 +1650,9 @@ class RDMAVan : public Van {
   std::vector<std::thread*> ipc_copy_thread_list_;
   std::vector<ThreadsafeQueue<AsyncCopy>*> async_copy_queue_;
   std::atomic<unsigned long long> cpy_counter_{0};
-};  // namespace ps
+
+};  // class RDMAVan
+
 };  // namespace ps
 
 #endif  // DMLC_USE_RDMA

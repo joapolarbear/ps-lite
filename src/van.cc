@@ -494,10 +494,14 @@ void Van::Receiving() {
   }
 }
 
+int Van::GetPackMetaLen(const Meta &meta) {
+  return sizeof(RawMeta) + meta.body.size() +
+         meta.data_type.size() * sizeof(int) +
+         meta.control.node.size() * sizeof(RawNode);
+}
+
 void Van::PackMeta(const Meta &meta, char **meta_buf, int *buf_size) {
-  *buf_size = sizeof(RawMeta) + meta.body.size() + 
-              meta.data_type.size() * sizeof(int) + 
-              meta.control.node.size() * sizeof(RawNode);
+  *buf_size = GetPackMetaLen(meta);
   // allocate buffer only when needed
   if (*meta_buf == nullptr) {
     *meta_buf = new char[*buf_size + 1];

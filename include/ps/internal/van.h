@@ -106,6 +106,11 @@ class Van {
   virtual int SendMsg(Message &msg) = 0;
 
   /**
+   * \brief get the length of pack meta
+   */
+  int GetPackMetaLen(const Meta &meta);
+
+  /**
    * \brief pack meta into a string
    */
   void PackMeta(const Meta &meta, char **meta_buf, int *buf_size);

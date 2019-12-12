@@ -16,7 +16,6 @@
 #include "ps/internal/message.h"
 namespace ps {
 class Resender;
-class PBMeta;
 /**
  * \brief Van sends messages to remote nodes
  *

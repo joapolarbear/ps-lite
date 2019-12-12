@@ -639,8 +639,8 @@ class RDMAVan : public Van {
 
       endpoint->SetNodeID(node.id);
 
-      Transport* tran = is_local_[node.id] ? std::make_unique<IPCTransport>() : std::make_unique<RDMATransport>();
-      endpoint->SetTransport(tran);
+      Transport* t = is_local_[node.id] ? std::make_unique<IPCTransport>() : std::make_unique<RDMATransport>();
+      endpoint->SetTransport(t);
 
       struct addrinfo *remote_addr;
       CHECK_EQ(
@@ -809,166 +809,53 @@ class RDMAVan : public Van {
   int SendMsg(Message &msg) override {
     int remote_id = msg.meta.recver;
     CHECK_NE(remote_id, Meta::kEmpty);
+    CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
+    Endpoint *endpoint = endpoints_[remote_id].get();
 
     PBMeta meta;
     PackMetaPB(msg.meta, &meta);
-    CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
-    Endpoint *endpoint = endpoints_[remote_id].get();
     MessageBuffer *msg_buf = new MessageBuffer();
     
     size_t meta_len = meta.ByteSize();
-    size_t data_len = msg.meta.data_size;
-    size_t total_len = meta_len + data_len;
-    CHECK(meta_len);
+    size_t total_len = meta_len + msg.meta.data_size;
 
-    // prepare memory
-    if (!IsValidPushpull(msg)) { // simple_app or control message
-      msg_buf->inline_len = total_len;
-      msg_buf->inline_buf = mempool_->Alloc(total_len);
-      meta.SerializeToArray(msg_buf->inline_buf, meta_len);
-    } else { // data message
-      msg_buf->inline_len = meta_len;
-      msg_buf->inline_buf = mempool_->Alloc(meta_len);
-      msg_buf->data = msg.data;
-      meta.SerializeToArray(msg_buf->inline_buf, meta_len);
-      if (!is_server_ && !is_local_[remote_id]) { // worker, send to non-local servers
-        for (auto &sa : msg_buf->data) {
-          if (!sa.size()) continue;
-          auto search_map_iterator = memory_mr_map_.find(sa.data());
-          CHECK_NE(search_map_iterator, memory_mr_map_.end()) << "not registered memory region";
-          MRPtr ptr(search_map_iterator->second, [](struct ibv_mr *mr) {});
-          CHECK(ptr.get()) << strerror(errno);
-          msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
-        }
+    msg_buf->inline_len = meta_len;
+    msg_buf->inline_buf = mempool_->Alloc(meta_len);
+    meta.SerializeToArray(msg_buf->inline_buf, meta_len);
+    msg_buf->data = msg.data;
+
+    // prepare memory 
+    if (!is_server_ && !is_local_[remote_id]) { 
+      for (auto &sa : msg_buf->data) {
+        if (!sa.size()) continue;
+        auto it = memory_mr_map_.find(sa.data());
+        CHECK_NE(it, memory_mr_map_.end()) << "not registered memory region";
+        MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
+        CHECK(ptr.get()) << strerror(errno);
+        msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
       }
     }
 
     auto trans = endpoint.GetTransport();
-    if (!IsValidPushpull(msg)) { // control message
-      msg_buf->inline_len = total_len;
-      msg_buf->inline_buf = mempool_->Alloc(total_len);
-      meta.SerializeToArray(msg_buf->inline_buf, meta_len);
-      trans->SendControlMessage();
-    } else if (msg.meta.push && msg.meta.request) { // worker, push request
-      std::lock_guard<std::mutex> lock(map_mu_);
-      uint64_t key = DecodeKey(msg.data[0]);
-      msg.meta.key = key;
-
-      CHECK_EQ(msg.data.size(), 3) << msg.data.size();
-      CHECK_NE(memory_mr_map_.find(msg.data[1].data()), memory_mr_map_.end());
-
-      auto& vals = msg.data[1];
-      msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
-      msg.meta.val_len = vals.size();
-      msg.meta.option = memory_mr_map_[vals.data()]->rkey;
-
-      trans->SendPushRequest();
-    } else if (msg.meta.push && !msg.meta.request) { // server, push response
-      trans->SendPushResponse();
-    } else if (!msg.meta.push && msg.meta.request) { // worker, pull request
-      trans->SendPullRequest();
-    } else if (!msg.meta.push && !msg.meta.request) { // server, pull response
-      CHECK(is_server_);
-      CHECK_EQ(msg.data.size(), 3) << msg.data.size();
-
-      std::lock_guard<std::mutex> lock(map_mu_);
-      uint64_t key = msg.meta.key;
-      auto recver = msg.meta.recver;
-
-      CHECK_NE(key_meta_map_.find(key), key_meta_map_.end())
-          << "key=" << key << " not inited in key_meta_map";
-      CHECK_NE(key_meta_map_[key].find(recver), key_meta_map_[key].end())
-          << "key=" << key << ", recver=" << recver << " not inited in key_meta_map[key]";
-
-      msg.meta.val_len = std::get<0>(key_meta_map_[key][recver]);
-      msg.meta.addr = std::get<1>(key_meta_map_[key][recver]);
-      msg.meta.option = std::get<2>(key_meta_map_[key][recver]);
-
-      // RDMA write or IPC
-      std::lock_guard<std::mutex> lock(map_mu_);
-      auto key = msg.meta.key;
-      auto recver = msg.meta.recver;
-      auto len = std::get<0>(key_meta_map_[key][recver]);
-
-      CHECK_EQ(msg_buf->data.size(), 3) << "Actual msg_buf size is " << msg_buf->data.size();
-      CHECK_NE(key_meta_map_.find(key), key_meta_map_.end())
-            << "key=" << key << " not initiated";
-      CHECK_NE(key_meta_map_[key].find(recver), key_meta_map_[key].end())
-            << "key=" << key
-            << ", recver=" << recver
-            << " not initiated";
-      CHECK_EQ(msg_buf->data[1].size(), (unsigned int) len)
-            << msg_buf->data[1].size() << ", " << len;
-
-      if (is_local_[remote_id]) { 
-        // IPC
-        auto addr = (void*) msg_buf->data[1].data();
-        CHECK(addr);
-        void* shm_addr = GetSharedMemory(kShmPrefix, key);
-        // async copy
-        AsyncCopy m = {endpoint, msg_buf, shm_addr, addr, len, meta_len, false};
-        auto cnt = cpy_counter_.fetch_add(1);
-        async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
-        return total_len;
-      } else { 
-        // RDMA write
-        auto raddr = std::get<1>(key_meta_map_[key][recver]);
-        auto rkey = std::get<2>(key_meta_map_[key][recver]);
-
-        auto temp_mr = memory_mr_map_.find(msg_buf->data[1].data());
-        CHECK_NE(temp_mr, memory_mr_map_.end());
-
-        struct ibv_sge sge;
-        sge.addr = reinterpret_cast<uint64_t>(msg_buf->data[1].data());
-        sge.length = msg_buf->data[1].size();
-        sge.lkey = temp_mr->second->lkey;
-
-        struct ibv_send_wr wr, *bad_wr = nullptr;
-        memset(&wr, 0, sizeof(wr));
-
-        wr.wr_id = reinterpret_cast<uint64_t>(raddr);
-        wr.opcode = IBV_WR_RDMA_WRITE;
-        wr.next = nullptr;
-        // wr.send_flags = IBV_SEND_SIGNALED;
-        wr.sg_list = &sge;
-        wr.num_sge = 1;
-
-        wr.wr.rdma.remote_addr = raddr;
-        wr.wr.rdma.rkey = rkey;
-
-        CHECK_EQ(ibv_post_send(endpoint->cm_id->qp, &wr, &bad_wr), 0)
-          << "ibv_post_send failed.";
-      }
-
-      trans->SendPullResponse();
+    if (!IsValidPushpull(msg)) { 
+      // control message
+      trans->SendControlMessage(endpoint, msg_buf);
+    } else if (msg.meta.push && msg.meta.request) { 
+      // worker, push request
+      trans->SendPushRequest(endpoint, msg_buf);
+    } else if (msg.meta.push && !msg.meta.request) { 
+      // server, push response
+      trans->SendPushResponse(endpoint, msg_buf);
+    } else if (!msg.meta.push && msg.meta.request) { 
+      // worker, pull request
+      trans->SendPullRequest(endpoint, msg_buf);
+    } else if (!msg.meta.push && !msg.meta.request) { 
+      // server, pull response
+      trans->SendPullResponse(endpoint, msg_buf);
     } else {
       CHECK(0) << "unexpected message type";
     }
 
-    WRContext *context = nullptr, *reserved = nullptr;
-    endpoint->free_write_ctx.WaitAndPop(&reserved);
-    endpoint->free_start_ctx.WaitAndPop(&context);
-    
-    msg_buf->reserved_context = reserved;
-    RendezvousStart *req =
-        reinterpret_cast<RendezvousStart *>(context->buffer->addr);
-    req->meta_len = meta_len;
-    req->origin_addr = reinterpret_cast<uint64_t>(msg_buf);
-    
-    auto addr = reinterpret_cast<uint64_t>(req);
-
-    // rendezvous message, not data message
-    if (!is_server_ && is_local_[remote_id] && IsValidPushpull(msg)) { 
-      // local IPC with shared memory
-      req->data_num = 0;
-    } else { 
-      // normal RDMA
-      req->data_num = msg.data.size();
-      for (size_t i = 0; i < req->data_num; ++i) {
-        req->data_len[i] = msg.data[i].size();
-      }
-    }
-    SendRendezvousBegin(endpoint, addr, context, kRendezvousStart);
     return total_len;
   }
 

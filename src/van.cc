@@ -504,6 +504,7 @@ void Van::PackMeta(const Meta &meta, char **meta_buf, int *buf_size) {
   }
 
   RawMeta *raw = (RawMeta*)*meta_buf;
+  bzero(raw, sizeof(RawMeta));
   char *raw_body = *meta_buf + sizeof(RawMeta);
   int *raw_data_type = (int*)(raw_body + meta.body.size());
   RawNode *raw_node = (RawNode*)(raw_data_type + meta.data_type.size());

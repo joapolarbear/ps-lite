@@ -18,7 +18,8 @@
 
 #ifdef DMLC_USE_RDMA
 
-#include "transport.h"
+#include "rdma_utils.h"
+#include "rdma_transport.h"
 
 namespace ps {
 

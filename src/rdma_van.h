@@ -378,23 +378,21 @@ class RDMAVan : public Van {
     meta.SerializeToArray(msg_buf->inline_buf, meta_len);
     msg_buf->data = msg.data;
 
-    // prepare memory 
-    if (!is_server_ && !is_local_[remote_id]) { 
-      for (auto &sa : msg_buf->data) {
-        if (!sa.size()) continue;
-        auto it = memory_mr_map_.find(sa.data());
-        CHECK_NE(it, memory_mr_map_.end()) << "not registered memory region";
-        MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
-        CHECK(ptr.get()) << strerror(errno);
-        msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
-      }
-    }
-
     auto trans = endpoint.GetTransport();
     if (!IsValidPushpull(msg)) { 
-      // control message
-      trans->SendControlMessage(msg_buf);
-    } else if (msg.meta.push && msg.meta.request) { 
+      trans->SendRendezvousBegin(msg_buf);
+      return total_len;
+    } else {
+      auto is_push = msg.meta.push;
+      auto key = DecodeKey(msg.data[0]);
+      if (!trans->HasRemoteInfo(msg_buf, key, is_push)) {
+        trans->SendRendezvousBegin(msg_buf);
+        return total_len;
+      }
+    }
+    
+    // already know remote address, directly use RDMA-write 
+    if (msg.meta.push && msg.meta.request) { 
       // worker, push request
       trans->SendPushRequest(msg_buf);
     } else if (msg.meta.push && !msg.meta.request) { 
@@ -433,111 +431,8 @@ class RDMAVan : public Van {
     uint64_t data_num = buffer_ctx->data_num;
     cur += buffer_ctx->meta_len;
 
-    bool is_released = false;
-    if (is_server_ && IsValidPushpull(*msg) && is_local_[msg->meta.sender]) {
-      // get data message from local shared memory
-      auto key = msg->meta.key;
-
-      std::lock_guard<std::mutex> lock(map_mu_);
-      if (key_addr_map_.find(key) == key_addr_map_.end()) {
-        key_addr_map_[key] = key;
-      }
-
-      SArray<char> keys;
-      SArray<char> vals;
-      SArray<char> lens;
-      keys.reset(reinterpret_cast<char*>(&key_addr_map_[key]), sizeof(ps::Key), [](void *){});
-      msg->data.push_back(keys);
-      total_len += keys.size();
-
-      if (msg->meta.push && msg->meta.request) { // push request
-        auto len = msg->meta.val_len;
-        if (key_len_map_.find(key) == key_len_map_.end()) {
-          key_len_map_[key] = len;
-        }
-        CHECK_EQ(len, key_len_map_[key]) << "key=" << key 
-            << ": " << len << ", " << key_len_map_[key];
-      
-        void* addr = GetSharedMemory(kShmPrefix, key);
-        vals.reset(reinterpret_cast<char*>(addr), len, [](void *){});
-        lens.reset(reinterpret_cast<char*>(&key_len_map_[key]), sizeof(int), [](void *){});
-        msg->data.push_back(vals);
-        msg->data.push_back(lens);
-      } else { // pull request
-        msg->data.push_back(vals);
-      }
-      total_len += vals.size() + lens.size();
-
-      mempool_->Free(buffer_ctx->buffer);
-      is_released = true;
-    }
-
-    if (IsValidPushpull(*msg) && !msg->meta.push && !msg->meta.request) { 
-      // worker, get message directly from inplace tensor
-      std::lock_guard<std::mutex> lock(map_mu_);
-      auto key = msg->meta.key;
-      CHECK(!is_server_);
-      if (key_len_map_.find(key) == key_len_map_.end()) {
-        key_addr_map_[key] = (ps::Key) key;
-        key_len_map_[key] = (int) msg->meta.val_len;
-      }
-      CHECK_NE(key_len_map_.find(key), key_len_map_.end()) << key;
-      CHECK_NE(key_addr_map_.find(key), key_addr_map_.end()) << key;
-
-      auto addr = msg->meta.addr;
-
-      CHECK_NE(key_len_map_[key], 0) << msg->DebugString();
-
-      SArray<char> keys;
-      SArray<char> vals;
-      SArray<char> lens;
-
-      keys.reset(reinterpret_cast<char*>(&key_addr_map_[key]), sizeof(ps::Key), [](void *){});
-      vals.reset(reinterpret_cast<char*>(addr), key_len_map_[key], [](void *){});
-      lens.reset(reinterpret_cast<char*>(&key_len_map_[key]), sizeof(int), [](void *){});
-
-      msg->data.push_back(keys);
-      msg->data.push_back(vals);
-      msg->data.push_back(lens);
-      total_len += keys.size() + vals.size() + lens.size();
-
-      mempool_->Free(buffer_ctx->buffer);
-    } else if (data_num > 0) {
-      Block *mem_block =
-          new Block(mempool_.get(), buffer_ctx->buffer, data_num);
-
-      for (size_t i = 0; i < data_num; i++) {
-        uint32_t len = buffer_ctx->data_len[i];
-        SArray<char> data;
-        data.reset(cur, len, [mem_block](void *) {
-          mem_block->Release();
-        });  // Defer the deletion of block_ref
-        msg->data.push_back(data);
-        cur += len;
-        total_len += len;
-      }
-    } else {
-      if (!is_released) mempool_->Free(buffer_ctx->buffer);
-    }
-
-    if (msg->meta.push && msg->meta.request) { // server
-      CHECK(is_server_);
-      auto key = msg->meta.key;
-      auto len = msg->meta.val_len;
-      auto addr = msg->meta.addr;
-      auto rkey = msg->meta.option;
-      auto sender = msg->meta.sender;
-
-      std::lock_guard<std::mutex> lock(map_mu_);
-      if (key_meta_map_.find(key) == key_meta_map_.end()
-            || key_meta_map_[key].find(sender) == key_meta_map_[key].end()) {
-        key_meta_map_[key][sender] = std::make_tuple(len, addr, rkey);
-      } else {
-        CHECK_EQ(len, std::get<0>(key_meta_map_[key][sender]));
-        CHECK_EQ(addr, std::get<1>(key_meta_map_[key][sender]));
-        CHECK_EQ(rkey, std::get<2>(key_meta_map_[key][sender]));
-      }
-    }
+    auto trans = endpoint.GetTransport();
+    trans->Recv(msg);
 
     delete buffer_ctx;
     return total_len;
@@ -679,6 +574,7 @@ class RDMAVan : public Van {
 
               SendRendezvousReply(endpoint, buf_ctx, req->origin_addr);
             } else if (imm == kRendezvousReply) {
+              auto trans = endpoint.GetTransport();
               // LOG(INFO) << "opcode: IBV_WC_RECV kRendezvousReply";
               RendezvousReply *resp =
                   reinterpret_cast<RendezvousReply *>(mr->addr);
@@ -690,49 +586,10 @@ class RDMAVan : public Van {
               MessageBuffer *msg_buf =
                   reinterpret_cast<MessageBuffer *>(origin_addr);
 
-              struct ibv_sge sge[1 + msg_buf->mrs.size()];
-
-              sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
-              sge[0].length = msg_buf->inline_len;
-              sge[0].lkey = mempool_->LocalKey(msg_buf->inline_buf);
-
-              size_t num_sge = 1;
-              for (auto &pair : msg_buf->mrs) {
-                size_t length = pair.second;
-                CHECK(length);
-                sge[num_sge].addr =
-                    reinterpret_cast<uint64_t>(pair.first->addr);
-                sge[num_sge].length = length;
-                sge[num_sge].lkey = pair.first->lkey;
-                ++num_sge;
-              }
-              if (is_server_) CHECK_EQ(num_sge, 1) << num_sge;
-
-              WRContext *write_ctx = msg_buf->reserved_context;
-
-              MessageBuffer **tmp =
-                  reinterpret_cast<MessageBuffer **>(write_ctx->buffer->addr);
-              *tmp = msg_buf;  // write the addr of msg_buf into the mr buffer
-
-              struct ibv_send_wr wr, *bad_wr = nullptr;
-              memset(&wr, 0, sizeof(wr));
-
-              wr.wr_id = reinterpret_cast<uint64_t>(write_ctx);
-              wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-              wr.next = nullptr;
-
-              wr.imm_data = idx;
-
-              wr.send_flags = IBV_SEND_SIGNALED;
-              wr.sg_list = sge;
-              wr.num_sge = num_sge;
-
-              wr.wr.rdma.remote_addr = remote_addr;
-              wr.wr.rdma.rkey = rkey;
-
-              CHECK_EQ(ibv_post_send(endpoint->cm_id->qp, &wr, &bad_wr), 0)
-                  << "ibv_post_send failed.";
-
+              // Before RDMA write, store the remote info so that 
+              // subsequent write does not need repeated rendezvous 
+              trans->StoreRemoteInfo(msg_buf, remote_addr, rkey, idx);
+              trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
             } else {
               CHECK(0);
             }

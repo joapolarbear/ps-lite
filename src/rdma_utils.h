@@ -54,8 +54,8 @@ namespace ps {
 #define DIVUP(x, y) (((x)+(y)-1)/(y))
 #define ROUNDUP(x, y) (DIVUP((x), (y))*(y))
 
-static const int kStartDepth = 128;
-static const int kWriteDepth = kStartDepth;
+static const int kStartDepth = 1024;
+static const int kWriteDepth = kStartDepth * 2;
 
 static const int kRxDepth = kStartDepth + kWriteDepth;
 static const int kReplyDepth = kRxDepth;

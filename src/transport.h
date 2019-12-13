@@ -28,14 +28,15 @@ class Transport {
    virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
    virtual void Recv(Message *msg) = 0;
 
-   virtual void SendPullRequest(MessageBuffer *msg_buf) = 0;
-   virtual void SendPushRequest(MessageBuffer *msg_buf) = 0;
-   virtual void SendPushResponse(MessageBuffer *msg_buf)  = 0;
-   virtual void SendPullResponse(MessageBuffer *msg_buf) = 0;
+   virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf) = 0;
+   virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) = 0;
+   virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf)  = 0;
+   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf) = 0;
+   virtual void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) = 0;
+   virtual void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) = 0;
 
    virtual bool HasRemoteInfo(MessageBuffer *msg_buf, uint64_t key, bool is_push) = 0;
    virtual void StoreRemoteInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
-   virtual void SendRendezvousBegin(MessageBuffer *msg_buf) = 0;
 
 }; // class Transport
 
@@ -45,9 +46,16 @@ class RDMATransport : public Transport {
   explicit RDMATransport(Endpoint *endpoint, SimpleMempool *mempool) {
     endpoint_ = endpoint;
     mempool_ = mempool;
+    auto val = Environment::Get()->find("DMLC_ROLE");
+    std::string role(val);
+    is_server_ = role=="server";
+    if (is_server_) LOG(INFO) << "This is server";
+    else LOG(INFO) << "This is " << ((role=="worker") ? "worker" : "scheduler");
   };
 
-  ~RDMATransport();
+  ~RDMATransport() {
+    for (auto& it : mem_mr_map_) ibv_dereg_mr(it.second);
+  };
 
   void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
     // prepare memory
@@ -57,7 +65,7 @@ class RDMATransport : public Transport {
       std::lock_guard<std::mutex> lock(mr_mu_);
       if (mem_mr_map_.find(sa.data()) == mem_mr_map_.end()) {
         struct ibv_mr *temp_mr;
-        CHECK (temp_mr = ibv_reg_mr(pd_, sa.data(), sa.size(),
+        CHECK (temp_mr = ibv_reg_mr(mempool_->GetPD(), sa.data(), sa.size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
             << "Failed to register the memory region: " << strerror(errno)
             << ", sa.size()=" << sa.size();
@@ -107,7 +115,7 @@ class RDMATransport : public Transport {
         << "ibv_post_send failed.";
   }
 
-  void SendPushResponse(MessageBuffer *msg_buf) {
+  void SendPushResponse(Message &msg, MessageBuffer *msg_buf) {
     std::lock_guard<std::mutex> lk(mu_);
     auto key = DecodeKey(msg_buf->data[0]);
     auto remote_addr = std::get<0>(push_addr_[key]);
@@ -116,7 +124,7 @@ class RDMATransport : public Transport {
     RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
   }
 
-  void SendPullRequest(MessageBuffer *msg_buf) {
+  void SendPullRequest(Message &msg, MessageBuffer *msg_buf) {
     std::lock_guard<std::mutex> lk(mu_);
     auto key = DecodeKey(msg_buf->data[0]);
     auto remote_addr = std::get<0>(pull_addr_[key]);
@@ -149,7 +157,7 @@ class RDMATransport : public Transport {
     msgbuf_cache_.erase(buf);
   }
 
-  void SendRendezvousBegin(MessageBuffer *msg_buf) {
+  void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) {
     WRContext *context = nullptr, *reserved = nullptr;
     endpoint_->free_write_ctx.WaitAndPop(&reserved);
     endpoint_->free_start_ctx.WaitAndPop(&context);
@@ -161,7 +169,7 @@ class RDMATransport : public Transport {
     req->origin_addr = reinterpret_cast<uint64_t>(msg_buf);
     req->data_num = msg_buf->data.size();
     for (size_t i = 0; i < req->data_num; ++i) {
-      req->data_len[i] = msg->data[i].size();
+      req->data_len[i] = msg.data[i].size();
     }
     
     struct ibv_sge sge;
@@ -182,22 +190,68 @@ class RDMATransport : public Transport {
     CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
         << strerror(errno);
   }
-  
-  void SendPushRequest(MessageBuffer *msg_buf) override {
+
+  void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) {
+
+    BufferContext *buf_ctx = new BufferContext();
+    uint64_t len = req->meta_len;
+    buf_ctx->meta_len = req->meta_len;
+    buf_ctx->data_num = req->data_num;
+    for (size_t i = 0; i < req->data_num; ++i) {
+      buf_ctx->data_len[i] = req->data_len[i];
+      len += req->data_len[i];
+    }
+    char *buffer = mempool_->Alloc(is_server_ ? len : req->meta_len);
+    CHECK(buffer) << len;
+    buf_ctx->buffer = buffer;
+    WRContext *reply_ctx = nullptr;
+    endpoint_->free_reply_ctx.WaitAndPop(&reply_ctx);
+    RendezvousReply *resp =
+        reinterpret_cast<RendezvousReply *>(reply_ctx->buffer->addr);
+
+    char* buffer = buf_ctx->buffer;
+    resp->addr = reinterpret_cast<uint64_t>(buffer);
+    resp->rkey = mempool_->RemoteKey(buffer);
+    resp->origin_addr = req->origin_addr;
+    resp->idx = pool.StoreAddress(buf_ctx);
+
+    struct ibv_sge sge;
+    sge.addr = reinterpret_cast<uint64_t>(resp);
+    sge.length = sizeof(RendezvousReply);
+    sge.lkey = reply_ctx->buffer->lkey;
+
+    struct ibv_send_wr wr, *bad_wr = nullptr;
+    memset(&wr, 0, sizeof(wr));
+
+    wr.wr_id = reinterpret_cast<uint64_t>(reply_ctx);
+    wr.opcode = IBV_WR_SEND_WITH_IMM;
+    wr.next = nullptr;
+
+    wr.imm_data = kRendezvousReply;
+
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
+        << "ibv_post_send failed.";
+  }
+
+  virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) {
     std::lock_guard<std::mutex> lock(map_mu_);
     uint64_t key = DecodeKey(msg.data[0]);
     msg.meta.key = key;
 
     CHECK_EQ(msg.data.size(), 3) << msg.data.size();
-    CHECK_NE(memory_mr_map_.find(msg.data[1].data()), memory_mr_map_.end());
+    CHECK_NE(mem_mr_map_.find(msg.data[1].data()), mem_mr_map_.end());
 
     auto& vals = msg.data[1];
     msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
     msg.meta.val_len = vals.size();
-    msg.meta.option = memory_mr_map_[vals.data()]->rkey;
+    msg.meta.option = mem_mr_map_[vals.data()]->rkey;
   }
 
-  void SendPullResponse(MessageBuffer *msg_buf) override {
+  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf) {
     std::lock_guard<std::mutex> lock(map_mu_);
     uint64_t key = msg.meta.key;
     auto recver = msg.meta.recver;
@@ -215,8 +269,8 @@ class RDMATransport : public Transport {
     auto raddr = std::get<1>(key_meta_map_[key][recver]);
     auto rkey = std::get<2>(key_meta_map_[key][recver]);
 
-    auto temp_mr = memory_mr_map_.find(msg_buf->data[1].data());
-    CHECK_NE(temp_mr, memory_mr_map_.end());
+    auto temp_mr = mem_mr_map_.find(msg_buf->data[1].data());
+    CHECK_NE(temp_mr, mem_mr_map_.end());
 
     struct ibv_sge sge;
     sge.addr = reinterpret_cast<uint64_t>(msg_buf->data[1].data());
@@ -236,35 +290,75 @@ class RDMATransport : public Transport {
     wr.wr.rdma.remote_addr = raddr;
     wr.wr.rdma.rkey = rkey;
 
-    CHECK_EQ(ibv_post_send(endpoint->cm_id->qp, &wr, &bad_wr), 0)
+    CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
       << "ibv_post_send failed.";
   }
 
   void Recv(Message *msg) {
-    
+
   }
  
  protected:
   Endpoint *endpoint_;
   SimpleMempool *mempool_;
+  // role is server or worker
+  bool is_server_;
   std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > push_addr_; // key, <remote_addr, rkey, idx>
   std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > pull_addr_; // key, <remote_addr, rkey, idx>
   std::unordered_map<uint64_t, bool> msgbuf_cache_; // msg_buf, is_push
   std::mutex mu_;
 
   std::unordered_map<char*, struct ibv_mr*> mem_mr_map_;
+  std::mutex map_mu_;
+  // macros for key_meta_map
+  using MetaInfo = std::tuple<int, uint64_t, int>; // len, addr, rkey
+  using SenderMeta = std::unordered_map<int, MetaInfo>; // sender as the key
+  // (key, sender) --> MetaInfo
+  std::unordered_map<ps::Key, SenderMeta> key_meta_map_;
   std::mutex mr_mu_;
 }; // class Transport
+
 
 
 class IPCTransport : public RDMATransport {
  public:
 
-  void SendPushRequest(Message &msg) override {
+  explicit IPCTransport(Endpoint *endpoint, SimpleMempool *mempool) : RDMATransport(endpoint, mempool) {
+    auto val = Environment::Get()->find("BYTEPS_IPC_COPY_NUM_THREADS");
+    ipc_copy_nthreads_ = val ? atoi(val) : 4;
+    LOG(INFO) << "IPC async copy nthreads set to " << ipc_copy_nthreads_;
+    for (int i = 0; i < ipc_copy_nthreads_; ++i) {
+      auto q = new ThreadsafeQueue<AsyncCopy>;
+      async_copy_queue_.push_back(q);
+    }
+    for (int i = 0; i < ipc_copy_nthreads_; ++i) {
+      auto t = new std::thread(&IPCTransport::AsyncCopyThread, this, i);
+      ipc_copy_thread_list_.push_back(t);
+    }
+    val = Environment::Get()->find("BYTEPS_PARTITION_BYTES");
+    byteps_partition_bytes_ = val ? atoi(val) : 4096000;
+
+    val = Environment::Get()->find("BYTEPS_LOCAL_SIZE");
+    auto byteps_local_size = val ? atoi(val) : 1;
+    byteps_partition_bytes_ = AlignTo(byteps_partition_bytes_, (8 * byteps_local_size));
+    CHECK(val) << "BYTEPS_LOCAL_SIZE not set";
+    LOG(INFO) << "partition bytes set to " << byteps_partition_bytes_ << ", should be identical with byteps core";
+  };
+
+  ~IPCTransport() {
+    for (size_t i = 0; i < ipc_copy_thread_list_.size(); ++i) {
+      AsyncCopy m;
+      m.shutdown = true;
+      async_copy_queue_[i]->Push(m);
+      ipc_copy_thread_list_[i]->join();
+    }
+  }
+
+  void SendPushRequest(Message &msg, MessageBuffer *msg_buf) {
     // get from shared memory
   }
 
-  void SendPullResponse(Message &msg) override {
+  void SendPullResponse(Message &msg, MessageBuffer *msg_buf) {
     // std::lock_guard<std::mutex> lock(map_mu_);
     // auto key = msg.meta.key;
     // auto recver = msg.meta.recver;
@@ -279,6 +373,92 @@ class IPCTransport : public RDMATransport {
     // auto cnt = cpy_counter_.fetch_add(1);
     // async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
   }
+
+  void AsyncCopyThread(int i) {
+    auto& q = async_copy_queue_[i];
+    while (true) {
+      AsyncCopy m;
+      q->WaitAndPop(&m);
+      if (m.shutdown) break;
+      if (m.len == 0) continue;
+
+      // TODO: use parallel copy
+      CHECK(m.dst);
+      CHECK(m.src);
+      memcpy(m.dst, m.src, m.len);
+
+      WRContext *context = nullptr, *reserved = nullptr;
+      m.endpoint->free_write_ctx.WaitAndPop(&reserved);
+      m.endpoint->free_start_ctx.WaitAndPop(&context);
+
+      m.msg_buf->reserved_context = reserved;
+      RendezvousStart *req =
+          reinterpret_cast<RendezvousStart *>(context->buffer->addr);
+      req->meta_len = m.meta_len;
+      req->origin_addr = reinterpret_cast<uint64_t>(m.msg_buf);
+
+      auto addr = reinterpret_cast<uint64_t>(req);
+      req->data_num = 0;
+
+      struct ibv_sge sge;
+      sge.addr = reinterpret_cast<uint64_t>(req);
+      sge.lkey = context->buffer->lkey;
+      sge.length = sizeof(RendezvousStart);
+
+      struct ibv_send_wr wr, *bad_wr = nullptr;
+      memset(&wr, 0, sizeof(wr));
+      wr.wr_id = reinterpret_cast<uint64_t>(context);
+      wr.opcode = IBV_WR_SEND_WITH_IMM;
+      wr.next = nullptr;
+      wr.imm_data = kRendezvousStart;
+      wr.send_flags = IBV_SEND_SIGNALED;
+      wr.sg_list = &sge;
+      wr.num_sge = 1;
+
+      CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
+          << strerror(errno);
+    }
+  }
+
+ private:
+
+  void* GetSharedMemory(const std::string& prefix, uint64_t key) {
+    std::lock_guard<std::mutex> lock(shm_mu_);
+    auto worker_key = DecodeWorkerKey(key);
+    auto seq_num = worker_key % (1 << 16);
+    auto base_key = worker_key - seq_num;
+    uint64_t offset = byteps_partition_bytes_ * seq_num;
+    if (key_shm_addr_.find(base_key) != key_shm_addr_.end()) {
+      return key_shm_addr_[base_key] + offset;
+    }
+    std::string shm_name(prefix);
+    shm_name += std::to_string(base_key);
+    int shm_fd = shm_open(shm_name.c_str(), O_RDWR, 0666);
+    CHECK_GE(shm_fd, 0) << "shm_open failed for " << shm_name;
+
+    struct stat sb;
+    CHECK_EQ(0, fstat(shm_fd, &sb)) << strerror(errno);
+    auto total_shm_size = sb.st_size;
+
+    void* base_ptr = mmap(0, total_shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    CHECK_NE(base_ptr, (void*) -1) << strerror(errno);
+    key_shm_addr_[base_key] = base_ptr;
+
+    LOG(INFO) << "open Shared Memory: " << shm_name
+              << ", offset=" << offset
+              << ", (in bytes) size=" << total_shm_size;
+    return key_shm_addr_[base_key] + offset;
+  }
+
+  int ipc_copy_nthreads_;
+  std::vector<std::thread*> ipc_copy_thread_list_;
+  std::vector<ThreadsafeQueue<AsyncCopy>*> async_copy_queue_;
+  std::atomic<unsigned long long> cpy_counter_{0};
+
+  int byteps_partition_bytes_ = 4096000;
+
+  std::mutex shm_mu_;
+  std::unordered_map<uint64_t, void *> key_shm_addr_;
 
 }; // class IPCTransport
 

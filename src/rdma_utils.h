@@ -203,6 +203,10 @@ class SimpleMempool {
     return mr->rkey;
   }
 
+  struct ibv_pd* GetPD() {
+    return pd_;
+  }
+
  private:
   std::mutex mu_;
   std::multimap<size_t, char *> free_list;
@@ -362,7 +366,7 @@ struct Endpoint {
   std::condition_variable cv;
   std::mutex connect_mu;
   struct rdma_cm_id *cm_id;
-  std::unique_ptr<Transport> tran;
+  std::shared_ptr<Transport> tran;
 
   WRContext rx_ctx[kRxDepth];
 
@@ -410,9 +414,9 @@ struct Endpoint {
     CHECK_EQ(rdma_destroy_id(cm_id), 0) << strerror(errno);
   }
 
-  void SetTransport(std::unique_ptr<Transport> t) { tran = t; }
+  void SetTransport(std::shared_ptr<Transport> t) { tran = t; }
 
-  std::unique_ptr<Transport> GetTransport() { return tran; }
+  std::shared_ptr<Transport> GetTransport() { return tran; }
 
   void Disconnect() {
     std::unique_lock<std::mutex> lk(connect_mu);
@@ -507,6 +511,29 @@ struct AsyncCopy {
   bool shutdown;
 };
 
+
+bool IsValidPushpull(const Message &msg) {
+  if (!msg.meta.control.empty()) return false;
+  if (msg.meta.simple_app) return false;
+  return true;
+}
+
+uint64_t DecodeKey(SArray<char> keys) { // just a translation, the decoded key might not be readable when we have multiple servers
+  ps::Key key = 0;
+  uint64_t coef = 1;
+  for (unsigned int i = 0; i < keys.size(); ++i) {
+    key += coef * (uint8_t) keys.data()[i];
+    coef *= 256; // 256=2^8 (uint8_t)
+  }
+  return key;
+}
+
+uint64_t DecodeWorkerKey(uint64_t key) {
+  auto kr = ps::Postoffice::Get()->GetServerKeyRanges()[ps::Postoffice::Get()->my_rank()];
+  return key - kr.begin();
+}
+
+int AlignTo(int input, int alignment) { return input / alignment * alignment; }
 
 };  // namespace ps
 

@@ -366,16 +366,18 @@ class RDMAVan : public Van {
     CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
     Endpoint *endpoint = endpoints_[remote_id].get();
 
-    PBMeta meta;
-    PackMetaPB(msg.meta, &meta);
+    CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
+    Endpoint *endpoint = endpoints_[remote_id].get();
     MessageBuffer *msg_buf = new MessageBuffer();
-    
-    size_t meta_len = meta.ByteSize();
-    size_t total_len = meta_len + msg.meta.data_size;
 
-    msg_buf->inline_len = meta_len;
-    msg_buf->inline_buf = mempool_->Alloc(meta_len);
-    meta.SerializeToArray(msg_buf->inline_buf, meta_len);
+    int meta_len = GetPackMetaLen(msg.meta);
+    size_t data_len = msg.meta.data_size;
+    size_t total_len = meta_len + data_len;
+    CHECK(meta_len);
+
+    msg_buf->inline_len = total_len;
+    msg_buf->inline_buf = mempool_->Alloc(total_len);
+    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
     msg_buf->data = msg.data;
 
     auto trans = endpoint.GetTransport();

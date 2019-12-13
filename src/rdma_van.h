@@ -431,7 +431,7 @@ class RDMAVan : public Van {
     uint64_t data_num = buffer_ctx->data_num;
     cur += buffer_ctx->meta_len;
 
-    auto trans = endpoint.GetTransport();
+    auto trans = endpoint->GetTransport();
     trans->Recv(msg);
 
     delete buffer_ctx;

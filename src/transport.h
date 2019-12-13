@@ -13,8 +13,8 @@
 // limitations under the License.
 // =============================================================================
 
-#ifndef PS_RDMA_VAN_H_
-#define PS_RDMA_VAN_H_
+#ifndef PS_RDMA_TRANSPORT_H_
+#define PS_RDMA_TRANSPORT_H_
 
 #ifdef DMLC_USE_RDMA
 
@@ -24,12 +24,30 @@ namespace ps {
 
 class Transport {
  public:
-  explicit Transport(Endpoint *endpoint, SimpleMempool *mempool) {
+
+   virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
+   virtual void Recv(Message *msg) = 0;
+
+   virtual void SendPullRequest(MessageBuffer *msg_buf) = 0;
+   virtual void SendPushRequest(MessageBuffer *msg_buf) = 0;
+   virtual void SendPushResponse(MessageBuffer *msg_buf)  = 0;
+   virtual void SendPullResponse(MessageBuffer *msg_buf) = 0;
+
+   virtual bool HasRemoteInfo(MessageBuffer *msg_buf, uint64_t key, bool is_push) = 0;
+   virtual void StoreRemoteInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
+   virtual void SendRendezvousBegin(MessageBuffer *msg_buf) = 0;
+
+}; // class Transport
+
+
+class RDMATransport : public Transport {
+ public:
+  explicit RDMATransport(Endpoint *endpoint, SimpleMempool *mempool) {
     endpoint_ = endpoint;
     mempool_ = mempool;
   };
 
-  ~Transport();
+  ~RDMATransport();
 
   void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
     // prepare memory
@@ -165,25 +183,6 @@ class Transport {
         << strerror(errno);
   }
   
-  void Recv(Message *msg);
-  void SendPushRequest(MessageBuffer *msg_buf);
-  void SendPullResponse(MessageBuffer *msg_buf);
- 
- private:
-  Endpoint *endpoint_;
-  SimpleMempool *mempool_;
-  std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > push_addr_; // key, <remote_addr, rkey, idx>
-  std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > pull_addr_; // key, <remote_addr, rkey, idx>
-  std::unordered_map<uint64_t, bool> msgbuf_cache_; // msg_buf, is_push
-  std::mutex mu_;
-
-  std::unordered_map<char*, struct ibv_mr*> mem_mr_map_;
-  std::mutex mr_mu_;
-}; // class Transport
-
-
-class RDMATransport : public Transport {
- public:
   void SendPushRequest(MessageBuffer *msg_buf) override {
     std::lock_guard<std::mutex> lock(map_mu_);
     uint64_t key = DecodeKey(msg.data[0]);
@@ -241,14 +240,24 @@ class RDMATransport : public Transport {
       << "ibv_post_send failed.";
   }
 
-  void Recv(Message *msg) override {
-
+  void Recv(Message *msg) {
+    
   }
+ 
+ protected:
+  Endpoint *endpoint_;
+  SimpleMempool *mempool_;
+  std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > push_addr_; // key, <remote_addr, rkey, idx>
+  std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > pull_addr_; // key, <remote_addr, rkey, idx>
+  std::unordered_map<uint64_t, bool> msgbuf_cache_; // msg_buf, is_push
+  std::mutex mu_;
 
-}; // class RDMATransport
+  std::unordered_map<char*, struct ibv_mr*> mem_mr_map_;
+  std::mutex mr_mu_;
+}; // class Transport
 
 
-class IPCTransport : public Transport {
+class IPCTransport : public RDMATransport {
  public:
 
   void SendPushRequest(Message &msg) override {

@@ -13,8 +13,8 @@
 // limitations under the License.
 // =============================================================================
 
-#ifndef PS_RDMA_VAN_H_
-#define PS_RDMA_VAN_H_
+#ifndef PS_RDMA_UTILS_H_
+#define PS_RDMA_UTILS_H_
 
 #ifdef DMLC_USE_RDMA
 

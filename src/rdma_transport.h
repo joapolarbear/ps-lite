@@ -387,11 +387,11 @@ class RDMATransport : public Transport {
   }
 
   void AddMeta(Message &msg) {
-    // should only be invoked when send 
+    if (msg.meta.request) {
+      msg.meta.key = DecodeKey(msg.data[0]);
+    }
     if (msg.meta.push && msg.meta.request) { 
       // push request
-      uint64_t key = DecodeKey(msg.data[0]);
-      msg.meta.key = key;
       CHECK_EQ(msg.data.size(), 3) << msg.data.size();
 
       std::lock_guard<std::mutex> lock(map_mu_);

@@ -247,19 +247,17 @@ class RDMAVan : public Van {
 
     trans->PrepareData(msg_buf);
 
-    // if (!IsValidPushpull(msg)) { 
-    //   trans->SendRendezvousBegin(msg, msg_buf);
-    //   return total_len;
-    // } else {
-    //   auto is_push = msg.meta.push;
-    //   auto key = DecodeKey(msg.data[0]);
-    //   if (!trans->HasRemoteInfo(msg_buf, key, is_push)) {
-    //     trans->SendRendezvousBegin(msg, msg_buf);
-    //     return total_len;
-    //   }
-    // }
-    trans->SendRendezvousBegin(msg, msg_buf);
-    return total_len;
+    if (!IsValidPushpull(msg)) { 
+      trans->SendRendezvousBegin(msg, msg_buf);
+      return total_len;
+    } else {
+      auto is_push = msg.meta.push;
+      auto key = msg.meta.key;
+      if (!trans->HasRemoteInfo(msg_buf, key, is_push)) {
+        trans->SendRendezvousBegin(msg, msg_buf);
+        return total_len;
+      }
+    }
     
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
@@ -400,11 +398,10 @@ class RDMAVan : public Van {
             ReleaseWorkRequestContext(context, endpoint);
           } break;
           case IBV_WC_RECV_RDMA_WITH_IMM: {
-            // LOG(INFO) << "opcode: IBV_WC_RECV_RDMA_WITH_IMM";
             uint32_t addr_idx = wc[i].imm_data;
-            BufferContext *buf_ctx = addr_pool_.GetAddressAndRelease(addr_idx);
+            BufferContext *buf_ctx = addr_pool_.GetAddress(addr_idx);
             recv_buffers_.Push(std::make_tuple(endpoint, buf_ctx));
-            ReleaseWorkRequestContext(context, endpoint);
+            // ReleaseWorkRequestContext(context, endpoint);
           } break;
           case IBV_WC_RECV: {
             CHECK(wc[i].wc_flags & IBV_WC_WITH_IMM);
@@ -431,7 +428,7 @@ class RDMAVan : public Van {
 
               // Before RDMA write, store the remote info so that 
               // subsequent write does not need repeated rendezvous 
-              // trans->StoreRemoteInfo(msg_buf, remote_addr, rkey, idx);
+              trans->StoreRemoteInfo(msg_buf, remote_addr, rkey, idx);
               trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
 
             } else {

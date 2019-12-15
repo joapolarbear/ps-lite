@@ -32,7 +32,7 @@ struct Endpoint {
   std::condition_variable cv;
   std::mutex connect_mu;
   struct rdma_cm_id *cm_id;
-  std::shared_ptr<Transport> tran;
+  std::shared_ptr<Transport> trans;
 
   WRContext rx_ctx[kRxDepth];
 
@@ -80,15 +80,15 @@ struct Endpoint {
     CHECK_EQ(rdma_destroy_id(cm_id), 0) << strerror(errno);
   }
 
-  void SetTransport(std::shared_ptr<Transport> t) { tran = t; }
+  void SetTransport(std::shared_ptr<Transport> t) { trans = t; }
 
-  std::shared_ptr<Transport> GetTransport() { return tran; }
+  std::shared_ptr<Transport> GetTransport() { return trans; }
 
   void Disconnect() {
     std::unique_lock<std::mutex> lk(connect_mu);
     CHECK_EQ(rdma_disconnect(cm_id), 0) << strerror(errno);
     cv.wait(lk, [this] { return status == IDLE; });
-    tran.reset();
+    trans.reset();
   }
 
   void SetNodeID(int id) { node_id = id; }
@@ -189,6 +189,9 @@ class Transport {
    virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx) = 0;
   
    virtual void AddMeta(Message &msg) = 0;
+   virtual void RegisterMemory(Message &msg) = 0;
+   virtual void PrepareData(MessageBuffer *msg_buf) = 0;
+
 
    virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) = 0;
@@ -219,11 +222,9 @@ class RDMATransport : public Transport {
     for (auto& it : mem_mr_map_) ibv_dereg_mr(it.second);
   };
 
-  void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
-    // prepare memory
-    for (auto& sa : msg_buf->data) {
-      if (!sa.size()) continue;
-      CHECK(sa.data());
+  void RegisterMemory(Message &msg) {
+    for (auto& sa : msg.data) {
+      if (sa.size() == 0) continue;
       std::lock_guard<std::mutex> lock(map_mu_);
       if (mem_mr_map_.find(sa.data()) == mem_mr_map_.end()) {
         struct ibv_mr *temp_mr;
@@ -233,11 +234,21 @@ class RDMATransport : public Transport {
             << ", sa.size()=" << sa.size();
         mem_mr_map_[sa.data()] = temp_mr;
       }
+    }
+  }
+
+  void PrepareData(MessageBuffer *msg_buf) {
+    for (auto &sa : msg_buf->data) {
+      std::lock_guard<std::mutex> lock(map_mu_);
+      if (sa.size() == 0) continue;
       auto it = mem_mr_map_.find(sa.data());
       MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
       CHECK(ptr.get()) << strerror(errno);
       msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
     }
+  }
+
+  void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
 
     // prepare RDMA write sge list
     struct ibv_sge sge[1 + msg_buf->mrs.size()];

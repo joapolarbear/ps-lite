@@ -212,12 +212,10 @@ class RDMAVan : public Van {
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
       }
 
-      if (node.id != my_node_.id) {
-        std::shared_ptr<Transport> t = is_local_[node.id] ?
-            std::make_shared<IPCTransport>(endpoint, mempool_.get()) :
-            std::make_shared<RDMATransport>(endpoint, mempool_.get());
-        endpoint->SetTransport(t);
-      }
+      std::shared_ptr<Transport> t = is_local_[node.id] ?
+          std::make_shared<IPCTransport>(endpoint, mempool_.get()) :
+          std::make_shared<RDMATransport>(endpoint, mempool_.get());
+      endpoint->SetTransport(t);
 
       freeaddrinfo(remote_addr);
     }
@@ -249,17 +247,19 @@ class RDMAVan : public Van {
 
     trans->PrepareData(msg_buf);
 
-    if (!IsValidPushpull(msg)) { 
-      trans->SendRendezvousBegin(msg, msg_buf);
-      return total_len;
-    } else {
-      auto is_push = msg.meta.push;
-      auto key = DecodeKey(msg.data[0]);
-      if (!trans->HasRemoteInfo(msg_buf, key, is_push)) {
-        trans->SendRendezvousBegin(msg, msg_buf);
-        return total_len;
-      }
-    }
+    // if (!IsValidPushpull(msg)) { 
+    //   trans->SendRendezvousBegin(msg, msg_buf);
+    //   return total_len;
+    // } else {
+    //   auto is_push = msg.meta.push;
+    //   auto key = DecodeKey(msg.data[0]);
+    //   if (!trans->HasRemoteInfo(msg_buf, key, is_push)) {
+    //     trans->SendRendezvousBegin(msg, msg_buf);
+    //     return total_len;
+    //   }
+    // }
+    trans->SendRendezvousBegin(msg, msg_buf);
+    return total_len;
     
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
@@ -337,7 +337,6 @@ class RDMAVan : public Van {
     CHECK(pd_) << "Failed to allocate protection domain";
 
     mempool_.reset(new SimpleMempool(pd_));
-    LOG(INFO) << "mempool_ inited ==========";
 
     comp_event_channel_ = ibv_create_comp_channel(context_);
 
@@ -432,7 +431,7 @@ class RDMAVan : public Van {
 
               // Before RDMA write, store the remote info so that 
               // subsequent write does not need repeated rendezvous 
-              trans->StoreRemoteInfo(msg_buf, remote_addr, rkey, idx);
+              // trans->StoreRemoteInfo(msg_buf, remote_addr, rkey, idx);
               trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
 
             } else {

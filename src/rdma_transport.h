@@ -180,7 +180,6 @@ struct AsyncCopy {
 
 class Transport {
  public:
-
    virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
    virtual int Recv(Message *msg, BufferContext *buffer_ctx) = 0;
    virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx) = 0;
@@ -191,7 +190,6 @@ class Transport {
    virtual void AddMeta(Message &msg) = 0;
    virtual void RegisterMemory(Message &msg) = 0;
    virtual void PrepareData(MessageBuffer *msg_buf) = 0;
-
 
    virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) = 0;
@@ -214,8 +212,6 @@ class RDMATransport : public Transport {
     auto val = Environment::Get()->find("DMLC_ROLE");
     std::string role(val);
     is_server_ = (role=="server");
-    if (is_server_) LOG(INFO) << "This is server";
-    else LOG(INFO) << "This is " << ((role=="worker") ? "worker" : "scheduler");
   };
 
   ~RDMATransport() {
@@ -239,8 +235,8 @@ class RDMATransport : public Transport {
 
   void PrepareData(MessageBuffer *msg_buf) {
     for (auto &sa : msg_buf->data) {
-      std::lock_guard<std::mutex> lock(map_mu_);
       if (sa.size() == 0) continue;
+      std::lock_guard<std::mutex> lock(map_mu_);
       auto it = mem_mr_map_.find(sa.data());
       MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
       CHECK(ptr.get()) << strerror(errno);
@@ -249,7 +245,6 @@ class RDMATransport : public Transport {
   }
 
   void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
-
     // prepare RDMA write sge list
     struct ibv_sge sge[1 + msg_buf->mrs.size()];
     sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);

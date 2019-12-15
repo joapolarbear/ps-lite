@@ -227,6 +227,8 @@ class RDMAVan : public Van {
     CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
     Endpoint *endpoint = endpoints_[remote_id].get();
 
+    auto trans = endpoint->GetTransport();
+
     MessageBuffer *msg_buf = new MessageBuffer();
 
     int meta_len = GetPackMetaLen(msg.meta);
@@ -236,10 +238,12 @@ class RDMAVan : public Van {
 
     msg_buf->inline_len = total_len;
     msg_buf->inline_buf = mempool_->Alloc(total_len);
-    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
     msg_buf->data = msg.data;
 
-    auto trans = endpoint->GetTransport();
+    if (IsValidPushpull(msg)) trans->AddMeta(msg);
+
+    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
+
     if (!IsValidPushpull(msg)) { 
       trans->SendRendezvousBegin(msg, msg_buf);
       return total_len;

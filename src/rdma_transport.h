@@ -22,15 +22,173 @@
 
 namespace ps {
 
+class Transport;
+
+struct Endpoint {
+  enum ConnectionStatus { IDLE, CONNECTING, CONNECTED, REJECTED };
+
+  ConnectionStatus status;
+  int node_id;
+  std::condition_variable cv;
+  std::mutex connect_mu;
+  struct rdma_cm_id *cm_id;
+  std::shared_ptr<Transport> tran;
+
+  WRContext rx_ctx[kRxDepth];
+
+  WRContext start_ctx[kStartDepth];
+  WRContext reply_ctx[kReplyDepth];
+  WRContext write_ctx[kWriteDepth];
+
+  ThreadsafeQueue<WRContext *> free_start_ctx;
+  ThreadsafeQueue<WRContext *> free_reply_ctx;
+  ThreadsafeQueue<WRContext *> free_write_ctx;
+
+  Endpoint() : status(IDLE), node_id(Node::kEmpty), cm_id(nullptr), rx_ctx() {}
+
+  ~Endpoint() {
+    for (int i = 0; i < kRxDepth; ++i) {
+      if (!(rx_ctx[i].buffer)) {
+        continue;
+      }
+      free(rx_ctx[i].buffer->addr);
+      CHECK_EQ(ibv_dereg_mr(rx_ctx[i].buffer), 0);
+    }
+
+    for (int i = 0; i < kStartDepth; ++i) {
+      if (start_ctx[i].buffer) {
+        free(start_ctx[i].buffer->addr);
+        CHECK_EQ(ibv_dereg_mr(start_ctx[i].buffer), 0);
+      }
+    }
+
+    for (int i = 0; i < kReplyDepth; ++i) {
+      if (reply_ctx[i].buffer) {
+        free(reply_ctx[i].buffer->addr);
+        CHECK_EQ(ibv_dereg_mr(reply_ctx[i].buffer), 0);
+      }
+    }
+
+    for (int i = 0; i < kWriteDepth; ++i) {
+      if (write_ctx[i].buffer) {
+        free(write_ctx[i].buffer->addr);
+        CHECK_EQ(ibv_dereg_mr(write_ctx[i].buffer), 0);
+      }
+    }
+
+    rdma_destroy_qp(cm_id);
+    CHECK_EQ(rdma_destroy_id(cm_id), 0) << strerror(errno);
+  }
+
+  void SetTransport(std::shared_ptr<Transport> t) { tran = t; }
+
+  std::shared_ptr<Transport> GetTransport() { return tran; }
+
+  void Disconnect() {
+    std::unique_lock<std::mutex> lk(connect_mu);
+    CHECK_EQ(rdma_disconnect(cm_id), 0) << strerror(errno);
+    cv.wait(lk, [this] { return status == IDLE; });
+    tran.reset();
+  }
+
+  void SetNodeID(int id) { node_id = id; }
+
+  void InitSendContextHelper(struct ibv_pd *pd, WRContext *ctx,
+                             ThreadsafeQueue<WRContext *> *queue, size_t num,
+                             WRContextType type) {
+    for (size_t i = 0; i < num; ++i) {
+      void *buf;
+      ib_malloc((void**) &buf, kMempoolChunkSize);
+      CHECK(buf);
+      struct ibv_mr *mr = ibv_reg_mr(pd, buf, kMempoolChunkSize, 0);
+      CHECK(mr);
+
+      ctx[i].type = type;
+      ctx[i].buffer = mr;
+      ctx[i].private_data = this;
+      queue->Push(&ctx[i]);
+    }
+  }
+
+  void Init(struct ibv_cq *cq, struct ibv_pd *pd) {
+    struct ibv_qp_init_attr attr;
+    memset(&attr, 0, sizeof(ibv_qp_init_attr));
+    attr.send_cq = cq;
+    attr.recv_cq = cq;
+    attr.cap.max_send_wr = kStartDepth + kReplyDepth + kWriteDepth;
+    attr.cap.max_recv_wr = kRxDepth;
+    attr.cap.max_send_sge = kSGEntry;
+    attr.cap.max_recv_sge = kSGEntry;
+    attr.qp_type = IBV_QPT_RC;
+    attr.sq_sig_all = 0;
+
+    CHECK_EQ(rdma_create_qp(cm_id, pd, &attr), 0)
+        << "Create RDMA queue pair failed";
+
+    InitSendContextHelper(pd, start_ctx, &free_start_ctx, kStartDepth,
+                          kRendezvousStartContext);
+    InitSendContextHelper(pd, reply_ctx, &free_reply_ctx, kReplyDepth,
+                          kRendezvousReplyContext);
+    InitSendContextHelper(pd, write_ctx, &free_write_ctx, kWriteDepth,
+                          kWriteContext);
+
+    for (size_t i = 0; i < kRxDepth; ++i) {
+      void *buf;
+      ib_malloc((void**) &buf, kMempoolChunkSize);
+      CHECK(buf);
+      struct ibv_mr *mr =
+          ibv_reg_mr(pd, buf, kMempoolChunkSize, IBV_ACCESS_LOCAL_WRITE);
+      CHECK(mr);
+
+      rx_ctx[i].type = kReceiveContext;
+      rx_ctx[i].buffer = mr;
+      rx_ctx[i].private_data = this;
+
+      PostRecv(&rx_ctx[i]);
+    }
+  }
+
+  void PostRecv(WRContext *ctx) {
+    struct ibv_recv_wr wr, *bad_wr = nullptr;
+    memset(&wr, 0, sizeof(wr));
+
+    struct ibv_sge sge;
+    sge.addr = reinterpret_cast<uint64_t>(ctx->buffer->addr);
+    sge.length = kMempoolChunkSize;
+    sge.lkey = ctx->buffer->lkey;
+
+    wr.wr_id = reinterpret_cast<uint64_t>(ctx);
+    wr.next = nullptr;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    CHECK_EQ(ibv_post_recv(cm_id->qp, &wr, &bad_wr), 0)
+        << "ibv_post_recv failed.";
+  }
+};
+
+struct AsyncCopy {
+  Endpoint* endpoint;
+  MessageBuffer* msg_buf;
+  void* dst;
+  void* src;
+  int len;
+  uint64_t meta_len;
+  bool shutdown;
+};
+
+
 class Transport {
  public:
 
    virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
-   virtual void Recv(Message *msg) = 0;
-   virtual void RecvPushRequest(Message *msg, BufferContext *buffer_ctx) = 0;
-   virtual void RecvPullRequest(Message *msg, BufferContext *buffer_ctx) = 0;
-   virtual void RecvPushResponse(Message *msg, BufferContext *buffer_ctx) = 0;
-   virtual void RecvPullResponse(Message *msg, BufferContext *buffer_ctx) = 0;
+   virtual int Recv(Message *msg, BufferContext *buffer_ctx) = 0;
+   virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx) = 0;
+   virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx) = 0;
+   virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx) = 0;
+   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx) = 0;
+  
+   virtual void AddMeta(Message &msg) = 0;
 
    virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) = 0;
@@ -119,26 +277,8 @@ class RDMATransport : public Transport {
         << "ibv_post_send failed.";
   }
 
-  void SendPushResponse(Message &msg, MessageBuffer *msg_buf) {
-    std::lock_guard<std::mutex> lk(mu_);
-    auto key = DecodeKey(msg_buf->data[0]);
-    auto remote_addr = std::get<0>(push_addr_[key]);
-    auto rkey = std::get<1>(push_addr_[key]);
-    auto idx = std::get<2>(push_addr_[key]);
-    RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
-  }
-
-  void SendPullRequest(Message &msg, MessageBuffer *msg_buf) {
-    std::lock_guard<std::mutex> lk(mu_);
-    auto key = DecodeKey(msg_buf->data[0]);
-    auto remote_addr = std::get<0>(pull_addr_[key]);
-    auto rkey = std::get<1>(pull_addr_[key]);
-    auto idx = std::get<2>(pull_addr_[key]);
-    RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
-  }
-
   bool HasRemoteInfo(MessageBuffer *msg_buf, uint64_t key, bool is_push) {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(addr_mu_);
     if ( is_push && (push_addr_.find(key) != push_addr_.end())) return true;
     if (!is_push && (pull_addr_.find(key) != pull_addr_.end())) return true;
     // no remote info, store the msg_buf address and push/pull flag for RendezvousReply
@@ -151,7 +291,7 @@ class RDMATransport : public Transport {
     auto key = DecodeKey(msg_buf->data[0]);
     auto buf = reinterpret_cast<uint64_t>(msg_buf);
 
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<std::mutex> lk(addr_mu_);
     auto is_push = msgbuf_cache_[buf];
     if (is_push) {
       push_addr_.emplace(key, std::make_tuple(remote_addr, rkey, idx));
@@ -195,8 +335,7 @@ class RDMATransport : public Transport {
         << strerror(errno);
   }
 
-  void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) {
-
+  void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &addrpool) {
     BufferContext *buf_ctx = new BufferContext();
     uint64_t len = req->meta_len;
     buf_ctx->meta_len = req->meta_len;
@@ -210,14 +349,14 @@ class RDMATransport : public Transport {
     buf_ctx->buffer = buffer;
     WRContext *reply_ctx = nullptr;
     endpoint_->free_reply_ctx.WaitAndPop(&reply_ctx);
+
     RendezvousReply *resp =
         reinterpret_cast<RendezvousReply *>(reply_ctx->buffer->addr);
 
-    char* buffer = buf_ctx->buffer;
     resp->addr = reinterpret_cast<uint64_t>(buffer);
     resp->rkey = mempool_->RemoteKey(buffer);
     resp->origin_addr = req->origin_addr;
-    resp->idx = pool.StoreAddress(buf_ctx);
+    resp->idx = addrpool.StoreAddress(buf_ctx);
 
     struct ibv_sge sge;
     sge.addr = reinterpret_cast<uint64_t>(resp);
@@ -241,35 +380,65 @@ class RDMATransport : public Transport {
         << "ibv_post_send failed.";
   }
 
+  void AddMeta(Message &msg) {
+    // should only be invoked when send 
+    if (msg.meta.push && msg.meta.request) { 
+      // push request
+      uint64_t key = DecodeKey(msg.data[0]);
+      msg.meta.key = key;
+      CHECK_EQ(msg.data.size(), 3) << msg.data.size();
+
+      std::lock_guard<std::mutex> lock(map_mu_);
+      CHECK_NE(mem_mr_map_.find(msg.data[1].data()), mem_mr_map_.end());
+
+      auto& vals = msg.data[1];
+      msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
+      msg.meta.val_len = vals.size();
+      msg.meta.option = mem_mr_map_[vals.data()]->rkey;
+    } else if (!msg.meta.push && !msg.meta.request) {
+      // pull response
+      uint64_t key = msg.meta.key;
+      auto recver = msg.meta.recver;
+
+      std::lock_guard<std::mutex> lock(map_mu_);
+      CHECK_NE(key_meta_map_.find(key), key_meta_map_.end())
+          << "key=" << key << " not inited in key_meta_map";
+      CHECK_NE(key_meta_map_[key].find(recver), key_meta_map_[key].end())
+          << "key=" << key << ", recver=" << recver << " not inited in key_meta_map[key]";
+
+      msg.meta.val_len = std::get<0>(key_meta_map_[key][recver]);
+      msg.meta.addr = std::get<1>(key_meta_map_[key][recver]);
+      msg.meta.option = std::get<2>(key_meta_map_[key][recver]);
+    }
+  }
+
+  void SendPushResponse(Message &msg, MessageBuffer *msg_buf) {
+    auto key = DecodeKey(msg_buf->data[0]);
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    auto remote_addr = std::get<0>(push_addr_[key]);
+    auto rkey = std::get<1>(push_addr_[key]);
+    auto idx = std::get<2>(push_addr_[key]);
+    RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
+  }
+
+  void SendPullRequest(Message &msg, MessageBuffer *msg_buf) {
+    auto key = DecodeKey(msg_buf->data[0]);
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    auto remote_addr = std::get<0>(pull_addr_[key]);
+    auto rkey = std::get<1>(pull_addr_[key]);
+    auto idx = std::get<2>(pull_addr_[key]);
+    RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
+  }
+
   virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) {
-    std::lock_guard<std::mutex> lock(map_mu_);
-    uint64_t key = DecodeKey(msg.data[0]);
-    msg.meta.key = key;
-
-    CHECK_EQ(msg.data.size(), 3) << msg.data.size();
-    CHECK_NE(mem_mr_map_.find(msg.data[1].data()), mem_mr_map_.end());
-
-    auto& vals = msg.data[1];
-    msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
-    msg.meta.val_len = vals.size();
-    msg.meta.option = mem_mr_map_[vals.data()]->rkey;
+    // RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
   }
 
   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf) {
     std::lock_guard<std::mutex> lock(map_mu_);
-    uint64_t key = msg.meta.key;
+    auto key = msg.meta.key;
     auto recver = msg.meta.recver;
-
-    CHECK_NE(key_meta_map_.find(key), key_meta_map_.end())
-        << "key=" << key << " not inited in key_meta_map";
-    CHECK_NE(key_meta_map_[key].find(recver), key_meta_map_[key].end())
-        << "key=" << key << ", recver=" << recver << " not inited in key_meta_map[key]";
-
-    msg.meta.val_len = std::get<0>(key_meta_map_[key][recver]);
-    msg.meta.addr = std::get<1>(key_meta_map_[key][recver]);
-    msg.meta.option = std::get<2>(key_meta_map_[key][recver]);
-
-    // RDMA write
+    auto len = std::get<0>(key_meta_map_[key][recver]);
     auto raddr = std::get<1>(key_meta_map_[key][recver]);
     auto rkey = std::get<2>(key_meta_map_[key][recver]);
 
@@ -339,6 +508,8 @@ class RDMATransport : public Transport {
   }
 
   virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx) {
+    int total_data_len = Recv(msg, buffer_ctx);
+
     auto key = msg->meta.key;
     auto len = msg->meta.val_len;
     auto addr = msg->meta.addr;
@@ -354,10 +525,11 @@ class RDMATransport : public Transport {
       CHECK_EQ(addr, std::get<1>(key_meta_map_[key][sender]));
       CHECK_EQ(rkey, std::get<2>(key_meta_map_[key][sender]));
     }
+    return total_data_len;
   }
 
  private:
-  int Recv(Message *msg, BufferContext *buffer_ctx) {
+  virtual int Recv(Message *msg, BufferContext *buffer_ctx) {
     uint64_t data_num = buffer_ctx->data_num;
     if (data_num == 0) {
       mempool_->Free(buffer_ctx->buffer);
@@ -368,7 +540,7 @@ class RDMATransport : public Transport {
     int total_data_len = 0;
     char *cur = buffer_ctx->buffer + buffer_ctx->meta_len; // offset
 
-    Block *mem_block = new Block(mempool_.get(), buffer_ctx->buffer, data_num);
+    Block *mem_block = new Block(mempool_, buffer_ctx->buffer, data_num);
     for (size_t i = 0; i < data_num; i++) {
       uint32_t len = buffer_ctx->data_len[i];
       SArray<char> data;
@@ -388,7 +560,7 @@ class RDMATransport : public Transport {
   SimpleMempool *mempool_;
   // role is server or worker
   bool is_server_;
-  std::mutex mu_;
+  std::mutex addr_mu_;
   std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > push_addr_; // key, <remote_addr, rkey, idx>
   std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > pull_addr_; // key, <remote_addr, rkey, idx>
   std::unordered_map<uint64_t, bool> msgbuf_cache_; // msg_buf, is_push

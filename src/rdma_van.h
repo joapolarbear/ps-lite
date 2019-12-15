@@ -280,20 +280,40 @@ class RDMAVan : public Van {
     Endpoint *endpoint = std::get<Endpoint *>(notification);
     BufferContext *buffer_ctx = std::get<BufferContext *>(notification);
 
-    int total_len = 0;
-
     msg->meta.recver = my_node_.id;
     msg->meta.sender = endpoint->node_id;
 
     char *cur = buffer_ctx->buffer;
 
     UnpackMeta(cur, buffer_ctx->meta_len, &msg->meta);
+
+    int total_len = 0;
     total_len += buffer_ctx->meta_len;
-    uint64_t data_num = buffer_ctx->data_num;
-    cur += buffer_ctx->meta_len;
 
     auto trans = endpoint->GetTransport();
-    trans->Recv(msg);
+
+    if (!IsValidPushpull(*msg)) {
+      mempool_->Free(buffer_ctx->buffer);
+      delete buffer_ctx;
+      return total_len;
+    }
+
+    // valid data message
+    if (msg->meta.push && msg->meta.request) { 
+      // push request
+      total_len += trans->RecvPushRequest(msg, buffer_ctx);
+    } else if (!msg->meta.push && msg->meta.request) { 
+      // pull request
+      total_len += trans->RecvPullRequest(msg, buffer_ctx);
+    } else if (msg->meta.push && !msg->meta.request) { 
+      // push response
+      total_len += trans->RecvPushResponse(msg, buffer_ctx);
+    } else if (!msg->meta.push && !msg->meta.request) { 
+      // pull response
+      total_len += trans->RecvPullResponse(msg, buffer_ctx);
+    } else {
+      CHECK(0) << "unknown msg type";
+    }
 
     delete buffer_ctx;
     return total_len;

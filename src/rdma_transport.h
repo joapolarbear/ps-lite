@@ -27,6 +27,10 @@ class Transport {
 
    virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
    virtual void Recv(Message *msg) = 0;
+   virtual void RecvPushRequest(Message *msg, BufferContext *buffer_ctx) = 0;
+   virtual void RecvPullRequest(Message *msg, BufferContext *buffer_ctx) = 0;
+   virtual void RecvPushResponse(Message *msg, BufferContext *buffer_ctx) = 0;
+   virtual void RecvPullResponse(Message *msg, BufferContext *buffer_ctx) = 0;
 
    virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) = 0;
@@ -48,7 +52,7 @@ class RDMATransport : public Transport {
     mempool_ = mempool;
     auto val = Environment::Get()->find("DMLC_ROLE");
     std::string role(val);
-    is_server_ = role=="server";
+    is_server_ = (role=="server");
     if (is_server_) LOG(INFO) << "This is server";
     else LOG(INFO) << "This is " << ((role=="worker") ? "worker" : "scheduler");
   };
@@ -294,8 +298,47 @@ class RDMATransport : public Transport {
       << "ibv_post_send failed.";
   }
 
-  void Recv(Message *msg) {
+  virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx) {
+    return Recv(msg, buffer_ctx);
+  }
 
+  virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx) {
+    return Recv(msg, buffer_ctx);
+  }
+
+  virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx) {
+    
+  }
+
+  virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx) {
+    
+  }
+
+ private:
+  int Recv(Message *msg, BufferContext *buffer_ctx) {
+    uint64_t data_num = buffer_ctx->data_num;
+    if (data_num == 0) {
+      mempool_->Free(buffer_ctx->buffer);
+      delete buffer_ctx;
+      return 0;
+    }    
+
+    int total_data_len = 0;
+    char *cur = buffer_ctx->buffer + buffer_ctx->meta_len; // offset
+
+    Block *mem_block = new Block(mempool_.get(), buffer_ctx->buffer, data_num);
+    for (size_t i = 0; i < data_num; i++) {
+      uint32_t len = buffer_ctx->data_len[i];
+      SArray<char> data;
+      data.reset(cur, len, [mem_block](void *) {
+        mem_block->Release();
+      });  // Defer the deletion of block_ref
+      msg->data.push_back(data);
+      cur += len;
+      total_data_len += len;
+    }
+
+    return total_data_len;
   }
  
  protected:

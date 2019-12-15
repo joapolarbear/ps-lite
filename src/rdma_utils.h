@@ -125,7 +125,7 @@ class SimpleMempool {
 
   ~SimpleMempool() {
     std::lock_guard<std::mutex> lk(mu_);
-    for(auto it = mr_list.begin(); it != mr_list.end(); it++){
+    for(auto it = mr_list.begin(); it != mr_list.end(); it++) {
       CHECK_EQ(ibv_dereg_mr(it->second), 0);
       free(it->second->addr);
     }

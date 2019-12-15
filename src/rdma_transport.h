@@ -66,7 +66,7 @@ class RDMATransport : public Transport {
     for (auto& sa : msg_buf->data) {
       if (!sa.size()) continue;
       CHECK(sa.data());
-      std::lock_guard<std::mutex> lock(mr_mu_);
+      std::lock_guard<std::mutex> lock(map_mu_);
       if (mem_mr_map_.find(sa.data()) == mem_mr_map_.end()) {
         struct ibv_mr *temp_mr;
         CHECK (temp_mr = ibv_reg_mr(mempool_->GetPD(), sa.data(), sa.size(),
@@ -307,11 +307,53 @@ class RDMATransport : public Transport {
   }
 
   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx) {
-    
+    int total_data_len = 0;
+    std::lock_guard<std::mutex> lock(map_mu_);
+    auto key = msg->meta.key;
+    if (key_len_map_.find(key) == key_len_map_.end()) {
+      key_addr_map_[key] = (ps::Key) key;
+      key_len_map_[key] = (int) msg->meta.val_len;
+    }
+    CHECK_NE(key_len_map_.find(key), key_len_map_.end()) << key;
+    CHECK_NE(key_addr_map_.find(key), key_addr_map_.end()) << key;
+
+    auto addr = msg->meta.addr;
+
+    CHECK_NE(key_len_map_[key], 0) << msg->DebugString();
+
+    SArray<char> keys;
+    SArray<char> vals;
+    SArray<char> lens;
+
+    keys.reset(reinterpret_cast<char*>(&key_addr_map_[key]), sizeof(ps::Key), [](void *){});
+    vals.reset(reinterpret_cast<char*>(addr), key_len_map_[key], [](void *){});
+    lens.reset(reinterpret_cast<char*>(&key_len_map_[key]), sizeof(int), [](void *){});
+
+    msg->data.push_back(keys);
+    msg->data.push_back(vals);
+    msg->data.push_back(lens);
+    total_data_len += keys.size() + vals.size() + lens.size();
+
+    mempool_->Free(buffer_ctx->buffer);
+    return total_data_len;
   }
 
   virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx) {
-    
+    auto key = msg->meta.key;
+    auto len = msg->meta.val_len;
+    auto addr = msg->meta.addr;
+    auto rkey = msg->meta.option;
+    auto sender = msg->meta.sender;
+
+    std::lock_guard<std::mutex> lock(map_mu_);
+    if (key_meta_map_.find(key) == key_meta_map_.end()
+          || key_meta_map_[key].find(sender) == key_meta_map_[key].end()) {
+      key_meta_map_[key][sender] = std::make_tuple(len, addr, rkey);
+    } else {
+      CHECK_EQ(len, std::get<0>(key_meta_map_[key][sender]));
+      CHECK_EQ(addr, std::get<1>(key_meta_map_[key][sender]));
+      CHECK_EQ(rkey, std::get<2>(key_meta_map_[key][sender]));
+    }
   }
 
  private:
@@ -346,19 +388,25 @@ class RDMATransport : public Transport {
   SimpleMempool *mempool_;
   // role is server or worker
   bool is_server_;
+  std::mutex mu_;
   std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > push_addr_; // key, <remote_addr, rkey, idx>
   std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > pull_addr_; // key, <remote_addr, rkey, idx>
   std::unordered_map<uint64_t, bool> msgbuf_cache_; // msg_buf, is_push
-  std::mutex mu_;
 
-  std::unordered_map<char*, struct ibv_mr*> mem_mr_map_;
+  // manage the following map
   std::mutex map_mu_;
-  // macros for key_meta_map
+
+  // (memory, ibv_mr) 
+  std::unordered_map<char*, struct ibv_mr*> mem_mr_map_;
+
+  // store the static address for keys and lens
+  std::unordered_map<ps::Key, ps::Key> key_addr_map_;
+  std::unordered_map<ps::Key, int> key_len_map_;
+
   using MetaInfo = std::tuple<int, uint64_t, int>; // len, addr, rkey
   using SenderMeta = std::unordered_map<int, MetaInfo>; // sender as the key
-  // (key, sender) --> MetaInfo
-  std::unordered_map<ps::Key, SenderMeta> key_meta_map_;
-  std::mutex mr_mu_;
+  std::unordered_map<ps::Key, SenderMeta> key_meta_map_; // (key, sender) --> MetaInfo
+  
 }; // class Transport
 
 

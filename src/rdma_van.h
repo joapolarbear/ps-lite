@@ -153,11 +153,6 @@ class RDMAVan : public Van {
 
       endpoint->SetNodeID(node.id);
 
-      std::shared_ptr<Transport> t = is_local_[node.id] ?
-          std::make_shared<IPCTransport>(endpoint, mempool_.get()) :
-          std::make_shared<RDMATransport>(endpoint, mempool_.get());
-      endpoint->SetTransport(t);
-
       struct addrinfo *remote_addr;
       CHECK_EQ(
           getaddrinfo(node.hostname.c_str(), std::to_string(node.port).c_str(),
@@ -215,6 +210,13 @@ class RDMAVan : public Van {
 
         if (endpoint->status == Endpoint::CONNECTED) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
+      }
+
+      if (node.id != my_node_.id) {
+        std::shared_ptr<Transport> t = is_local_[node.id] ?
+            std::make_shared<IPCTransport>(endpoint, mempool_.get()) :
+            std::make_shared<RDMATransport>(endpoint, mempool_.get());
+        endpoint->SetTransport(t);
       }
 
       freeaddrinfo(remote_addr);
@@ -335,6 +337,7 @@ class RDMAVan : public Van {
     CHECK(pd_) << "Failed to allocate protection domain";
 
     mempool_.reset(new SimpleMempool(pd_));
+    LOG(INFO) << "mempool_ inited ==========";
 
     comp_event_channel_ = ibv_create_comp_channel(context_);
 
@@ -534,6 +537,11 @@ class RDMAVan : public Van {
 
     endpoint->Init(cq_, pd_);
 
+    std::shared_ptr<Transport> t = is_local_[remote_ctx->node] ?
+        std::make_shared<IPCTransport>(endpoint, mempool_.get()) :
+        std::make_shared<RDMATransport>(endpoint, mempool_.get());
+    endpoint->SetTransport(t);
+
     RequestContext ctx;
     ctx.node = static_cast<uint32_t>(my_node_.id);
     ctx.port = static_cast<uint16_t>(my_node_.port);
@@ -561,7 +569,7 @@ class RDMAVan : public Van {
   void OnRouteResolved(struct rdma_cm_event *event) {
     struct rdma_cm_id *id = event->id;
     Endpoint *endpoint = reinterpret_cast<Endpoint *>(id->context);
-
+    
     if (context_ == nullptr) {
       InitContext(id->verbs);
     }

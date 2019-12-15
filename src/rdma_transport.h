@@ -209,8 +209,8 @@ class Transport {
 class RDMATransport : public Transport {
  public:
   explicit RDMATransport(Endpoint *endpoint, SimpleMempool *mempool) {
-    endpoint_ = endpoint;
-    mempool_ = mempool;
+    endpoint_ = CHECK_NOTNULL(endpoint);
+    mempool_ = CHECK_NOTNULL(mempool);
     auto val = Environment::Get()->find("DMLC_ROLE");
     std::string role(val);
     is_server_ = (role=="server");

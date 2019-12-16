@@ -233,6 +233,8 @@ class RDMAVan : public Van {
     MessageBuffer *msg_buf = new MessageBuffer();
 
     int meta_len = GetPackMetaLen(msg.meta);
+    CHECK_LE(meta_len, kMaxMetaBound) << meta_len;
+
     size_t data_len = msg.meta.data_size;
     size_t total_len = meta_len + data_len;
     CHECK(meta_len);
@@ -290,12 +292,14 @@ class RDMAVan : public Van {
     msg->meta.recver = my_node_.id;
     msg->meta.sender = endpoint->node_id;
 
-    char *cur = buffer_ctx->buffer;
-
-    UnpackMeta(cur, buffer_ctx->meta_len, &msg->meta);
+    // the second argument is actually deprecated, 
+    // we keep it as is in order to be compatible
+    UnpackMeta(buffer_ctx->buffer, buffer_ctx->meta_len, &msg->meta); 
+    int real_meta_len = GetPackMetaLen(msg->meta);
+    CHECK_LE(real_meta_len, kMaxMetaBound) << real_meta_len;
 
     int total_len = 0;
-    total_len += buffer_ctx->meta_len;
+    total_len += real_meta_len;
 
     auto trans = CHECK_NOTNULL(endpoint->GetTransport());
 

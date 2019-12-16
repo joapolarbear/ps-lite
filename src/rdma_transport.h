@@ -343,15 +343,18 @@ class RDMATransport : public Transport {
 
   void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &addrpool) {
     BufferContext *buf_ctx = new BufferContext();
-    uint64_t len = req->meta_len;
     buf_ctx->meta_len = req->meta_len;
     buf_ctx->data_num = req->data_num;
+
+    uint64_t data_len = 0;
     for (size_t i = 0; i < req->data_num; ++i) {
       buf_ctx->data_len[i] = req->data_len[i];
-      len += req->data_len[i];
+      data_len += req->data_len[i];
     }
-    char *buffer = mempool_->Alloc(is_server_ ? len : req->meta_len);
-    CHECK(buffer) << len;
+    
+    // worker only needs a buffer for receving meta
+    char *buffer = mempool_->Alloc(is_server_ ? (kMaxMetaBound + data_len) : kMaxMetaBound);
+    CHECK(buffer);
     buf_ctx->buffer = buffer;
     WRContext *reply_ctx = nullptr;
     endpoint_->free_reply_ctx.WaitAndPop(&reply_ctx);
@@ -544,7 +547,7 @@ class RDMATransport : public Transport {
     }    
 
     int total_data_len = 0;
-    char *cur = buffer_ctx->buffer + buffer_ctx->meta_len; // offset
+    char *cur = buffer_ctx->buffer + kMaxMetaBound; // offset
 
     Block *mem_block = new Block(mempool_, buffer_ctx->buffer, data_num);
     for (size_t i = 0; i < data_num; i++) {

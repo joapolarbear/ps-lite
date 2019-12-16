@@ -550,10 +550,10 @@ class RDMATransport : public Transport {
 
     int total_data_len = 0;
     char *cur = buffer_ctx->buffer + meta_len; // offset
+    LOG(INFO) << "meta_len=" << meta_len;
 
     for (size_t i = 0; i < data_num; i++) {
       uint32_t len = buffer_ctx->data_len[i];
-      LOG(INFO) << "=====Recv: data_len=" << len;
       SArray<char> data;
       data.reset(cur, len, [](void *) {});  // no need for delete
       msg->data.push_back(data);

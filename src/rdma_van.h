@@ -226,6 +226,11 @@ class RDMAVan : public Van {
     CHECK_NE(remote_id, Meta::kEmpty);
     CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
     Endpoint *endpoint = endpoints_[remote_id].get();
+ 
+    if (msg.meta.push && msg.meta.request) {
+      SArray<int> lens(msg.data[2]);
+      LOG(INFO) << "sendmsg, len=" << lens[0];
+    }
 
     auto trans = CHECK_NOTNULL(endpoint->GetTransport());
     trans->RegisterMemory(msg);
@@ -238,9 +243,12 @@ class RDMAVan : public Van {
     size_t total_len = meta_len + data_len;
     CHECK(meta_len);
 
-    msg_buf->inline_len = total_len;
-    msg_buf->inline_buf = mempool_->Alloc(total_len);
+    msg_buf->inline_len = meta_len;
+    msg_buf->inline_buf = mempool_->Alloc(meta_len);
     msg_buf->data = msg.data;
+
+    LOG(INFO) << "meta_len=" << meta_len
+              << ", total_len=" << total_len;
 
     if (IsValidPushpull(msg)) trans->AddMeta(msg);
 
@@ -395,13 +403,10 @@ class RDMAVan : public Van {
             ReleaseWorkRequestContext(context, endpoint);
             break;
           case IBV_WC_RDMA_WRITE: {
-            // do nothing
-            LOG(INFO) << "opcode: IBV_WC_RDMA_WRITE";
-
-            // MessageBuffer *msg_buf =
-                // *reinterpret_cast<MessageBuffer **>(context->buffer->addr);
-            // mempool_->Free(msg_buf->inline_buf);
-            // delete msg_buf;
+            MessageBuffer *msg_buf =
+                *reinterpret_cast<MessageBuffer **>(context->buffer->addr);
+            mempool_->Free(msg_buf->inline_buf);
+            delete msg_buf;
             // ReleaseWorkRequestContext(context, endpoint);
           } break;
           case IBV_WC_RECV_RDMA_WITH_IMM: {

@@ -226,11 +226,6 @@ class RDMAVan : public Van {
     CHECK_NE(remote_id, Meta::kEmpty);
     CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
     Endpoint *endpoint = endpoints_[remote_id].get();
- 
-    if (msg.meta.push && msg.meta.request) {
-      SArray<int> lens(msg.data[2]);
-      LOG(INFO) << "sendmsg, len=" << lens[0];
-    }
 
     auto trans = CHECK_NOTNULL(endpoint->GetTransport());
     trans->RegisterMemory(msg);
@@ -247,7 +242,7 @@ class RDMAVan : public Van {
     msg_buf->inline_buf = mempool_->Alloc(meta_len);
     msg_buf->data = msg.data;
 
-    LOG(INFO) << "meta_len=" << meta_len
+    LOG(INFO) << "Send a message with meta_len=" << meta_len 
               << ", total_len=" << total_len;
 
     if (IsValidPushpull(msg)) trans->AddMeta(msg);
@@ -263,6 +258,9 @@ class RDMAVan : public Van {
       auto is_push = msg.meta.push;
       auto key = msg.meta.key;
       if (!trans->HasRemoteInfo(msg_buf, key, is_push)) {
+        LOG(INFO) << "Call SendRendezvousBegin"
+                  << ", " << (is_push?"push":"pull")
+                  << " " << (msg.meta.request?"request":"response");
         trans->SendRendezvousBegin(msg, msg_buf);
         return total_len;
       }
@@ -271,15 +269,19 @@ class RDMAVan : public Van {
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
       // worker, push request
+      LOG(INFO) << "PUSH REQUEST";
       trans->SendPushRequest(msg, msg_buf);
     } else if (msg.meta.push && !msg.meta.request) { 
       // server, push response
+      LOG(INFO) << "PUSH RESPONSE";
       trans->SendPushResponse(msg, msg_buf);
     } else if (!msg.meta.push && msg.meta.request) { 
       // worker, pull request
+      LOG(INFO) << "PULL REQUEST";
       trans->SendPullRequest(msg, msg_buf);
     } else if (!msg.meta.push && !msg.meta.request) { 
       // server, pull response
+      LOG(INFO) << "PULL RESPONSE";
       trans->SendPullResponse(msg, msg_buf);
     } else {
       CHECK(0) << "unexpected message type";
@@ -303,6 +305,8 @@ class RDMAVan : public Van {
     // we keep it as is in order to be compatible
     UnpackMeta(buffer_ctx->buffer, buffer_ctx->meta_len, &msg->meta); 
     int meta_len = GetPackMetaLen(msg->meta);
+
+    LOG(INFO) << "receive a message with meta_len=" << meta_len;
 
     int total_len = 0;
     total_len += meta_len;

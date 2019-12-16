@@ -264,6 +264,7 @@ class RDMATransport : public Transport {
     }    
 
     WRContext *write_ctx = msg_buf->reserved_context;
+    CHECK(write_ctx);
     MessageBuffer **tmp =
         reinterpret_cast<MessageBuffer **>(write_ctx->buffer->addr);
     *tmp = msg_buf;  // write the addr of msg_buf into the mr buffer
@@ -525,8 +526,6 @@ class RDMATransport : public Transport {
     auto rkey = msg->meta.option;
     auto sender = msg->meta.sender;
 
-    LOG(INFO) << "key=" << key << " len=" << len << " sender=" << sender;
-
     std::lock_guard<std::mutex> lock(map_mu_);
     if (key_meta_map_.find(key) == key_meta_map_.end()
           || key_meta_map_[key].find(sender) == key_meta_map_[key].end()) {
@@ -544,7 +543,6 @@ class RDMATransport : public Transport {
     uint64_t data_num = buffer_ctx->data_num;
     if (data_num == 0) {
       mempool_->Free(buffer_ctx->buffer);
-      delete buffer_ctx;
       return 0;
     }    
 

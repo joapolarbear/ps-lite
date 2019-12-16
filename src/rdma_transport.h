@@ -181,16 +181,17 @@ struct AsyncCopy {
 class Transport {
  public:
    virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
-   virtual int Recv(Message *msg, BufferContext *buffer_ctx) = 0;
-   virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx) = 0;
-   virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx) = 0;
-   virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx) = 0;
-   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx) = 0;
+   virtual int Recv(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
+   virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
+   virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
+   virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
+   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
   
    virtual void AddMeta(Message &msg) = 0;
    virtual void RegisterMemory(Message &msg) = 0;
    virtual void PrepareData(MessageBuffer *msg_buf) = 0;
 
+   virtual void Send(Message &msg, MessageBuffer *msg_buf, bool is_push) = 0;
    virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf)  = 0;
@@ -346,14 +347,14 @@ class RDMATransport : public Transport {
     buf_ctx->meta_len = req->meta_len;
     buf_ctx->data_num = req->data_num;
 
-    uint64_t data_len = 0;
+    uint64_t len = req->meta_len;
     for (size_t i = 0; i < req->data_num; ++i) {
       buf_ctx->data_len[i] = req->data_len[i];
-      data_len += req->data_len[i];
+      len += req->data_len[i];
     }
     
     // worker only needs a buffer for receving meta
-    char *buffer = mempool_->Alloc(is_server_ ? (kMaxMetaBound + data_len) : kMaxMetaBound);
+    char *buffer = mempool_->Alloc(is_server_ ? (kMaxMetaBound + len) : (kMaxMetaBound + req->meta_len));
     CHECK(buffer);
     buf_ctx->buffer = buffer;
     WRContext *reply_ctx = nullptr;
@@ -421,26 +422,25 @@ class RDMATransport : public Transport {
     }
   }
 
-  void SendPushResponse(Message &msg, MessageBuffer *msg_buf) {
+  void Send(Message &msg, MessageBuffer *msg_buf, bool is_push) {
     auto key = DecodeKey(msg_buf->data[0]);
     std::lock_guard<std::mutex> lk(addr_mu_);
-    auto remote_addr = std::get<0>(push_addr_[key]);
-    auto rkey = std::get<1>(push_addr_[key]);
-    auto idx = std::get<2>(push_addr_[key]);
+    auto remote_addr = is_push ? std::get<0>(push_addr_[key]) : std::get<0>(pull_addr_[key]);
+    auto rkey = is_push ? std::get<1>(push_addr_[key]) : std::get<1>(pull_addr_[key]);
+    auto idx = is_push ? std::get<2>(push_addr_[key]) : std::get<2>(pull_addr_[key]);
     RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
+  }
+
+  void SendPushResponse(Message &msg, MessageBuffer *msg_buf) {
+    Send(msg, msg_buf, true);
   }
 
   void SendPullRequest(Message &msg, MessageBuffer *msg_buf) {
-    auto key = DecodeKey(msg_buf->data[0]);
-    std::lock_guard<std::mutex> lk(addr_mu_);
-    auto remote_addr = std::get<0>(pull_addr_[key]);
-    auto rkey = std::get<1>(pull_addr_[key]);
-    auto idx = std::get<2>(pull_addr_[key]);
-    RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
+    Send(msg, msg_buf, false);
   }
 
   virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) {
-    // RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
+    Send(msg, msg_buf, true);
   }
 
   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf) {
@@ -476,15 +476,15 @@ class RDMATransport : public Transport {
       << "ibv_post_send failed.";
   }
 
-  virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx) {
-    return Recv(msg, buffer_ctx);
+  virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) {
+    return Recv(msg, buffer_ctx, meta_len);
   }
 
-  virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx) {
-    return Recv(msg, buffer_ctx);
+  virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
+    return Recv(msg, buffer_ctx, meta_len);
   }
 
-  virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx) {
+  virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) {
     int total_data_len = 0;
     std::lock_guard<std::mutex> lock(map_mu_);
     auto key = msg->meta.key;
@@ -516,14 +516,16 @@ class RDMATransport : public Transport {
     return total_data_len;
   }
 
-  virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx) {
-    int total_data_len = Recv(msg, buffer_ctx);
+  virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
+    int total_data_len = Recv(msg, buffer_ctx, meta_len);
 
     auto key = msg->meta.key;
     auto len = msg->meta.val_len;
     auto addr = msg->meta.addr;
     auto rkey = msg->meta.option;
     auto sender = msg->meta.sender;
+
+    LOG(INFO) << "key=" << key << " len=" << len << " sender=" << sender;
 
     std::lock_guard<std::mutex> lock(map_mu_);
     if (key_meta_map_.find(key) == key_meta_map_.end()
@@ -538,7 +540,7 @@ class RDMATransport : public Transport {
   }
 
  private:
-  virtual int Recv(Message *msg, BufferContext *buffer_ctx) {
+  virtual int Recv(Message *msg, BufferContext *buffer_ctx, int meta_len) {
     uint64_t data_num = buffer_ctx->data_num;
     if (data_num == 0) {
       mempool_->Free(buffer_ctx->buffer);
@@ -547,15 +549,13 @@ class RDMATransport : public Transport {
     }    
 
     int total_data_len = 0;
-    char *cur = buffer_ctx->buffer + kMaxMetaBound; // offset
+    char *cur = buffer_ctx->buffer + meta_len; // offset
 
-    Block *mem_block = new Block(mempool_, buffer_ctx->buffer, data_num);
     for (size_t i = 0; i < data_num; i++) {
       uint32_t len = buffer_ctx->data_len[i];
+      LOG(INFO) << "=====Recv: data_len=" << len;
       SArray<char> data;
-      data.reset(cur, len, [mem_block](void *) {
-        mem_block->Release();
-      });  // Defer the deletion of block_ref
+      data.reset(cur, len, [](void *) {});  // no need for delete
       msg->data.push_back(data);
       cur += len;
       total_data_len += len;

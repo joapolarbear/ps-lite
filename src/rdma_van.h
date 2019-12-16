@@ -233,7 +233,6 @@ class RDMAVan : public Van {
     MessageBuffer *msg_buf = new MessageBuffer();
 
     int meta_len = GetPackMetaLen(msg.meta);
-    CHECK_LE(meta_len, kMaxMetaBound) << meta_len;
 
     size_t data_len = msg.meta.data_size;
     size_t total_len = meta_len + data_len;
@@ -295,11 +294,10 @@ class RDMAVan : public Van {
     // the second argument is actually deprecated, 
     // we keep it as is in order to be compatible
     UnpackMeta(buffer_ctx->buffer, buffer_ctx->meta_len, &msg->meta); 
-    int real_meta_len = GetPackMetaLen(msg->meta);
-    CHECK_LE(real_meta_len, kMaxMetaBound) << real_meta_len;
+    int meta_len = GetPackMetaLen(msg->meta);
 
     int total_len = 0;
-    total_len += real_meta_len;
+    total_len += meta_len;
 
     auto trans = CHECK_NOTNULL(endpoint->GetTransport());
 
@@ -312,16 +310,20 @@ class RDMAVan : public Van {
     // valid data message
     if (msg->meta.push && msg->meta.request) { 
       // push request
-      total_len += trans->RecvPushRequest(msg, buffer_ctx);
+      LOG(INFO) << "recv push request";
+      total_len += trans->RecvPushRequest(msg, buffer_ctx, meta_len);
     } else if (!msg->meta.push && msg->meta.request) { 
       // pull request
-      total_len += trans->RecvPullRequest(msg, buffer_ctx);
+      LOG(INFO) << "recv pull request";
+      total_len += trans->RecvPullRequest(msg, buffer_ctx, meta_len);
     } else if (msg->meta.push && !msg->meta.request) { 
       // push response
-      total_len += trans->RecvPushResponse(msg, buffer_ctx);
+      LOG(INFO) << "recv push response";
+      total_len += trans->RecvPushResponse(msg, buffer_ctx, meta_len);
     } else if (!msg->meta.push && !msg->meta.request) { 
       // pull response
-      total_len += trans->RecvPullResponse(msg, buffer_ctx);
+      LOG(INFO) << "recv push response";
+      total_len += trans->RecvPullResponse(msg, buffer_ctx, meta_len);
     } else {
       CHECK(0) << "unknown msg type";
     }
@@ -393,13 +395,14 @@ class RDMAVan : public Van {
             ReleaseWorkRequestContext(context, endpoint);
             break;
           case IBV_WC_RDMA_WRITE: {
-            // LOG(INFO) << "opcode: IBV_WC_RDMA_WRITE";
-            // Note: This is not a struct ibv_mr*
-            MessageBuffer *msg_buf =
-                *reinterpret_cast<MessageBuffer **>(context->buffer->addr);
-            mempool_->Free(msg_buf->inline_buf);
-            delete msg_buf;
-            ReleaseWorkRequestContext(context, endpoint);
+            // do nothing
+            LOG(INFO) << "opcode: IBV_WC_RDMA_WRITE";
+
+            // MessageBuffer *msg_buf =
+                // *reinterpret_cast<MessageBuffer **>(context->buffer->addr);
+            // mempool_->Free(msg_buf->inline_buf);
+            // delete msg_buf;
+            // ReleaseWorkRequestContext(context, endpoint);
           } break;
           case IBV_WC_RECV_RDMA_WITH_IMM: {
             uint32_t addr_idx = wc[i].imm_data;

@@ -17,7 +17,8 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
   uint64_t key = req_data.keys[0];
   if (req_meta.push) {
     CHECK(req_data.lens.size());
-    CHECK_EQ(req_data.vals.size(), (size_t)req_data.lens[0]);
+    CHECK_EQ(req_data.vals.size(), (size_t)req_data.lens[0]) 
+        << "key=" << key << ", " << req_data.vals.size() << ", " << req_data.lens[0];
 
     if (mem_map.find(key) == mem_map.end()) {
       PS_VLOG(1) << "key " << key << " from worker-" << req_meta.sender;
@@ -143,7 +144,7 @@ void RunWorker(int argc, char *argv[]) {
         auto start = std::chrono::high_resolution_clock::now();
         auto end = std::chrono::high_resolution_clock::now();
         auto val = Environment::Get()->find("THRESHOLD");
-        unsigned int threshold = val ? atoi(val) : 10;
+        unsigned int threshold = val ? atoi(val) : 1;
         val = Environment::Get()->find("LOG_DURATION");
         unsigned int log_duration = val ? atoi(val) : 50;
         int cnt = 0;

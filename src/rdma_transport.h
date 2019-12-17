@@ -232,9 +232,6 @@ class RDMATransport : public Transport {
   }
 
   void PrepareData(Message &msg, MessageBuffer *msg_buf) {
-    // pull response send with rdma write (no imm)
-    if (!msg.meta.push && !msg.meta.request) return; 
-
     for (auto &sa : msg_buf->data) {
       if (sa.size() == 0) continue;
       std::lock_guard<std::mutex> lock(map_mu_);
@@ -442,6 +439,11 @@ class RDMATransport : public Transport {
 
     CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
       << "ibv_post_send failed.";
+
+    // after write keys/vals/lens (no imm), write the meta (with imm)
+    // TODO: consolidate this into one RDMA_WRITE_WITH_IMM
+    msg_buf->mrs.clear(); 
+    Send(msg, msg_buf, remote_addr);
   }
 
   virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) {

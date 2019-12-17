@@ -301,7 +301,8 @@ class RDMAVan : public Van {
     msg->meta.recver = my_node_.id;
     msg->meta.sender = endpoint->node_id;
 
-    LOG(INFO) << "RecvMsg meta_len=" << buffer_ctx->meta_len;
+    LOG(INFO) << "RecvMsg meta_len=" << buffer_ctx->meta_len
+              << ", buffer addr=" << reinterpret_cast<uint64_t>(buffer_ctx->buffer);
 
     // the second argument is actually deprecated, 
     // we keep it as is in order to be compatible    
@@ -342,7 +343,6 @@ class RDMAVan : public Van {
       CHECK(0) << "unknown msg type";
     }
 
-    delete buffer_ctx;
     return total_len;
   }
 
@@ -418,6 +418,9 @@ class RDMAVan : public Van {
           case IBV_WC_RECV_RDMA_WITH_IMM: {
             uint32_t addr_idx = wc[i].imm_data;
             BufferContext *buf_ctx = addr_pool_.GetAddress(addr_idx);
+            LOG(INFO) << "------- receving RDMA_WITH_IMM with idx=" << addr_idx
+                      << " bufctx=" << reinterpret_cast<uint64_t>(buf_ctx)
+                      << " buffer=" << reinterpret_cast<uint64_t>(buf_ctx->buffer);
             recv_buffers_.Push(std::make_tuple(endpoint, buf_ctx));
             ReleaseWorkRequestContext(context, endpoint);
           } break;

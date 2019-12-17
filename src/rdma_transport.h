@@ -246,8 +246,6 @@ class RDMATransport : public Transport {
   }
 
   void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
-    LOG(INFO) << "RDMAWriteWithImm: remote_addr=" << remote_addr
-              << ", idx=" << idx;
     // prepare RDMA write sge list
     struct ibv_sge sge[1 + msg_buf->mrs.size()];
     sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
@@ -255,15 +253,23 @@ class RDMATransport : public Transport {
     sge[0].lkey = mempool_->LocalKey(msg_buf->inline_buf);
 
     size_t num_sge = 1;
+    
+    uint64_t data_len = 0;
     for (auto &pair : msg_buf->mrs) {
-      size_t length = pair.second;
+      size_t length = pair.second;      
       CHECK(length);
       sge[num_sge].addr =
           reinterpret_cast<uint64_t>(pair.first->addr);
       sge[num_sge].length = length;
       sge[num_sge].lkey = pair.first->lkey;
       ++num_sge;
-    }    
+      
+      data_len += length;
+    }
+
+    LOG(INFO) << "RDMAWriteWithImm: remote_addr=" << remote_addr
+              << ", idx=" << idx
+              << ", len=" << data_len;
 
     WRContext *write_ctx = msg_buf->reserved_context;
     CHECK(write_ctx);

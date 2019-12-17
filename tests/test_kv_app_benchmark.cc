@@ -182,7 +182,7 @@ void RunWorker(int argc, char *argv[]) {
         auto start = std::chrono::high_resolution_clock::now();
         auto end = std::chrono::high_resolution_clock::now();
         auto val = Environment::Get()->find("THRESHOLD");
-        unsigned int threshold = val ? atoi(val) : 10;
+        unsigned int threshold = val ? atoi(val) : 1;
         val = Environment::Get()->find("LOG_DURATION");
         unsigned int log_duration = val ? atoi(val) : 50;
         int cnt = 0;

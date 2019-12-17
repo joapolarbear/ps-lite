@@ -295,6 +295,8 @@ struct BufferContext {
 typedef std::unique_ptr<struct ibv_mr, std::function<void(struct ibv_mr *)>>
     MRPtr;
 
+typedef std::tuple<uint64_t, uint32_t, uint32_t> RemoteAddress; // <remote_addr, rkey, idx> 
+
 struct MessageBuffer {
   size_t inline_len;
   char *inline_buf;

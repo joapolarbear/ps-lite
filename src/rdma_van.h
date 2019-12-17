@@ -256,6 +256,30 @@ class RDMAVan : public Van {
     }
   }
 
+  bool HasRemoteInfo(MessageBuffer *msg_buf, uint64_t key, bool is_push) {
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    if ( is_push && (push_addr_.find(key) != push_addr_.end())) return true;
+    if (!is_push && (pull_addr_.find(key) != pull_addr_.end())) return true;
+    // no remote info, store the msg_buf address and push/pull flag for RendezvousReply
+    msgbuf_cache_.emplace(reinterpret_cast<uint64_t>(msg_buf), std::make_pair(key, is_push));
+    return false;
+  }
+
+  void StoreRemoteInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
+    auto buf = reinterpret_cast<uint64_t>(msg_buf);
+    if (msgbuf_cache_.find(buf) == msgbuf_cache_.end()) return; // control message
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    auto key = std::get<0>(msgbuf_cache_[buf]);
+    auto is_push = std::get<1>(msgbuf_cache_[buf]);
+    if (is_push) {
+      push_addr_[key] = std::make_tuple(remote_addr, rkey, idx);
+    } else {
+      pull_addr_[key] = std::make_tuple(remote_addr, rkey, idx);
+    }
+    CHECK_NE(msgbuf_cache_.find(buf), msgbuf_cache_.end());
+    msgbuf_cache_.erase(buf);
+  }
+
   int SendMsg(Message &msg) override {
     int remote_id = msg.meta.recver;
     CHECK_NE(remote_id, Meta::kEmpty);
@@ -284,40 +308,45 @@ class RDMAVan : public Van {
 
     PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
 
-    trans->PrepareData(msg_buf);
-
     if (!IsValidPushpull(msg)) { 
       trans->SendRendezvousBegin(msg, msg_buf);
       return total_len;
     } else {
+      trans->PrepareData(msg, msg_buf);
       auto is_push = msg.meta.push;
       auto key = msg.meta.key;
-      if (!trans->HasRemoteInfo(msg_buf, key, is_push)) {
+      if (!HasRemoteInfo(msg_buf, key, is_push)) {
         LOG(INFO) << "Call SendRendezvousBegin"
+                  << ", key=" << key
                   << ", " << (is_push?"push":"pull")
-                  << " " << (msg.meta.request?"request":"response");
+                  << " " << (msg.meta.request?"request":"response")
+                  << ", push_addr.size=" << push_addr_.size();
         trans->SendRendezvousBegin(msg, msg_buf);
         return total_len;
       }
     }
 
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    auto key = msg.meta.key;
+    auto remote_addr_tuple = (msg.meta.push ? push_addr_[key] : pull_addr_[key]);
+
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
       // worker, push request
-      LOG(INFO) << "PUSH REQUEST";
-      trans->SendPushRequest(msg, msg_buf);
+      LOG(INFO) << "SEND PUSH REQUEST, key=" << key;
+      trans->SendPushRequest(msg, msg_buf, remote_addr_tuple);
     } else if (msg.meta.push && !msg.meta.request) { 
       // server, push response
-      LOG(INFO) << "PUSH RESPONSE";
-      trans->SendPushResponse(msg, msg_buf);
+      LOG(INFO) << "SEND PUSH RESPONSE, key=" << key;
+      trans->SendPushResponse(msg, msg_buf, remote_addr_tuple);
     } else if (!msg.meta.push && msg.meta.request) { 
       // worker, pull request
-      LOG(INFO) << "PULL REQUEST";
-      trans->SendPullRequest(msg, msg_buf);
+      LOG(INFO) << "SEND PULL REQUEST, key=" << key;
+      trans->SendPullRequest(msg, msg_buf, remote_addr_tuple);
     } else if (!msg.meta.push && !msg.meta.request) { 
       // server, pull response
-      LOG(INFO) << "PULL RESPONSE";
-      trans->SendPullResponse(msg, msg_buf);
+      LOG(INFO) << "SEND PULL RESPONSE, key=" << key;
+      trans->SendPullResponse(msg, msg_buf, remote_addr_tuple);
     } else {
       CHECK(0) << "unexpected message type";
     }
@@ -355,20 +384,20 @@ class RDMAVan : public Van {
     // valid data message
     if (msg->meta.push && msg->meta.request) { 
       // push request
-      LOG(INFO) << "recv push request";
+      LOG(INFO) << "RECV PUSH REQUEST, key=" << msg->meta.key;
       total_len += trans->RecvPushRequest(msg, buffer_ctx, meta_len);
       StoreWorkerTensorAddress(msg);
     } else if (!msg->meta.push && msg->meta.request) { 
       // pull request
-      LOG(INFO) << "recv pull request";
+      LOG(INFO) << "RECV PULL REQUEST, key=" << msg->meta.key;
       total_len += trans->RecvPullRequest(msg, buffer_ctx, meta_len);
     } else if (msg->meta.push && !msg->meta.request) { 
       // push response
-      LOG(INFO) << "recv push response";
+      LOG(INFO) << "RECV PUSH RESPONSE, key=" << msg->meta.key;
       total_len += trans->RecvPushResponse(msg, buffer_ctx, meta_len);
     } else if (!msg->meta.push && !msg->meta.request) { 
       // pull response
-      LOG(INFO) << "recv push response";
+      LOG(INFO) << "RECV PULL RESPONSE, key=" << msg->meta.key;
       total_len += trans->RecvPullResponse(msg, buffer_ctx, meta_len);
     } else {
       CHECK(0) << "unknown msg type";
@@ -477,7 +506,8 @@ class RDMAVan : public Van {
 
               // Before RDMA write, store the remote info so that 
               // subsequent write does not need repeated rendezvous 
-              trans->StoreRemoteInfo(msg_buf, remote_addr, rkey, idx);
+              StoreRemoteInfo(msg_buf, remote_addr, rkey, idx);
+              LOG(INFO) << "kRendezvousReply: push_addr_.size=" << push_addr_.size();
               trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
 
             } else {
@@ -710,12 +740,17 @@ class RDMAVan : public Van {
   std::mutex local_mu_;
   std::unordered_map<int, bool> is_local_;
 
-  // to store worker's tensor address
+  // worker's tensor address
   std::mutex info_mu_;
-  using RemoteInfo = std::tuple<int, uint64_t, int>; // len, addr, rkey
-  using SenderMeta = std::unordered_map<int, RemoteInfo>; // sender as the key
-  std::unordered_map<ps::Key, SenderMeta> tensor_info_map_; // (key, sender) --> RemoteInfo
+  using TensorInfo = std::tuple<int, uint64_t, int>; // len, addr, rkey
+  using RemoteTensorMeta = std::unordered_map<int, TensorInfo>; // sender as the key
+  std::unordered_map<ps::Key, RemoteTensorMeta> tensor_info_map_; // (key, sender) --> TensorInfo
 
+  // store rendezvous address
+  std::mutex addr_mu_;
+  std::unordered_map<uint64_t, RemoteAddress> push_addr_; // key, <remote_addr, rkey, idx>
+  std::unordered_map<uint64_t, RemoteAddress> pull_addr_; // key, <remote_addr, rkey, idx>
+  std::unordered_map<uint64_t, std::pair<uint64_t, bool> > msgbuf_cache_; // msg_buf, <key, is_push>
 };  // class RDMAVan
 
 };  // namespace ps

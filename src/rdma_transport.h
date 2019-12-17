@@ -189,18 +189,15 @@ class Transport {
   
    virtual void AddMeta(Message &msg) = 0;
    virtual void RegisterMemory(Message &msg) = 0;
-   virtual void PrepareData(MessageBuffer *msg_buf) = 0;
+   virtual void PrepareData(Message &msg, MessageBuffer *msg_buf) = 0;
 
-   virtual void Send(Message &msg, MessageBuffer *msg_buf, bool is_push) = 0;
-   virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf) = 0;
-   virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) = 0;
-   virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf)  = 0;
-   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf) = 0;
+   virtual void Send(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) = 0;
+   virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) = 0;
+   virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) = 0;
+   virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr)  = 0;
+   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) = 0;
    virtual void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) = 0;
-
-   virtual bool HasRemoteInfo(MessageBuffer *msg_buf, uint64_t key, bool is_push) = 0;
-   virtual void StoreRemoteInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
 
 }; // class Transport
 
@@ -234,7 +231,10 @@ class RDMATransport : public Transport {
     }
   }
 
-  void PrepareData(MessageBuffer *msg_buf) {
+  void PrepareData(Message &msg, MessageBuffer *msg_buf) {
+    // pull response send with rdma write (no imm)
+    if (!msg.meta.push && !msg.meta.request) return; 
+
     for (auto &sa : msg_buf->data) {
       if (sa.size() == 0) continue;
       std::lock_guard<std::mutex> lock(map_mu_);
@@ -287,30 +287,6 @@ class RDMATransport : public Transport {
 
     CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
         << "ibv_post_send failed.";
-  }
-
-  bool HasRemoteInfo(MessageBuffer *msg_buf, uint64_t key, bool is_push) {
-    std::lock_guard<std::mutex> lk(addr_mu_);
-    if ( is_push && (push_addr_.find(key) != push_addr_.end())) return true;
-    if (!is_push && (pull_addr_.find(key) != pull_addr_.end())) return true;
-    // no remote info, store the msg_buf address and push/pull flag for RendezvousReply
-    msgbuf_cache_.emplace(reinterpret_cast<uint64_t>(msg_buf), is_push);
-    return false;
-  }
-
-  void StoreRemoteInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
-    if (msg_buf->data.size() == 0) return; 
-    auto key = DecodeKey(msg_buf->data[0]);
-    auto buf = reinterpret_cast<uint64_t>(msg_buf);
-
-    std::lock_guard<std::mutex> lk(addr_mu_);
-    auto is_push = msgbuf_cache_[buf];
-    if (is_push) {
-      push_addr_.emplace(key, std::make_tuple(remote_addr, rkey, idx));
-    } else {
-      pull_addr_.emplace(key, std::make_tuple(remote_addr, rkey, idx));
-    }
-    msgbuf_cache_.erase(buf);
   }
 
   void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) {
@@ -413,40 +389,38 @@ class RDMATransport : public Transport {
     }
   }
 
-  void Send(Message &msg, MessageBuffer *msg_buf, bool is_push) {
+  void Send(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
     WRContext *reserved = nullptr;
     endpoint_->free_write_ctx.WaitAndPop(&reserved);
     msg_buf->reserved_context = reserved;
-    auto key = DecodeKey(msg_buf->data[0]);
+    auto key = msg.meta.key;
 
-    std::lock_guard<std::mutex> lk(addr_mu_);
-    auto remote_addr = is_push ? std::get<0>(push_addr_[key]) : std::get<0>(pull_addr_[key]);
-    auto rkey = is_push ? std::get<1>(push_addr_[key]) : std::get<1>(pull_addr_[key]);
-    auto idx = is_push ? std::get<2>(push_addr_[key]) : std::get<2>(pull_addr_[key]);
+    auto raddr = std::get<0>(remote_addr);
+    auto rkey = std::get<1>(remote_addr);
+    auto idx = std::get<2>(remote_addr);
 
-    RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
+    RDMAWriteWithImm(msg_buf, raddr, rkey, idx);
   }
 
-  void SendPushResponse(Message &msg, MessageBuffer *msg_buf) {
-    Send(msg, msg_buf, true);
+  void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
+    Send(msg, msg_buf, remote_addr);
   }
 
-  void SendPullRequest(Message &msg, MessageBuffer *msg_buf) {
-    Send(msg, msg_buf, false);
+  void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
+    Send(msg, msg_buf, remote_addr);
   }
 
-  virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf) {
-    Send(msg, msg_buf, true);
+  virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
+    Send(msg, msg_buf, remote_addr);
   }
 
-  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf) {
+  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
     std::lock_guard<std::mutex> lock(map_mu_);
     auto key = msg.meta.key;
     auto recver = msg.meta.recver;
     auto len = msg.meta.val_len;
     auto raddr = msg.meta.addr;
     auto rkey = msg.meta.option;
-
     auto temp_mr = mem_mr_map_.find(msg_buf->data[1].data());
     CHECK_NE(temp_mr, mem_mr_map_.end());
 
@@ -457,14 +431,12 @@ class RDMATransport : public Transport {
 
     struct ibv_send_wr wr, *bad_wr = nullptr;
     memset(&wr, 0, sizeof(wr));
-
     wr.wr_id = reinterpret_cast<uint64_t>(raddr);
     wr.opcode = IBV_WR_RDMA_WRITE;
     wr.next = nullptr;
     // wr.send_flags = IBV_SEND_SIGNALED;
     wr.sg_list = &sge;
     wr.num_sge = 1;
-
     wr.wr.rdma.remote_addr = raddr;
     wr.wr.rdma.rkey = rkey;
 
@@ -519,7 +491,6 @@ class RDMATransport : public Transport {
   virtual int Recv(Message *msg, BufferContext *buffer_ctx, int meta_len) {
     uint64_t data_num = buffer_ctx->data_num;
     if (data_num == 0) {
-      mempool_->Free(buffer_ctx->buffer);
       return 0;
     }
 
@@ -543,10 +514,6 @@ class RDMATransport : public Transport {
   SimpleMempool *mempool_;
   // role is server or worker
   bool is_server_;
-  std::mutex addr_mu_;
-  std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > push_addr_; // key, <remote_addr, rkey, idx>
-  std::unordered_map<uint64_t, std::tuple<uint64_t, uint32_t, uint32_t> > pull_addr_; // key, <remote_addr, rkey, idx>
-  std::unordered_map<uint64_t, bool> msgbuf_cache_; // msg_buf, is_push
 
   // manage the following map
   std::mutex map_mu_;

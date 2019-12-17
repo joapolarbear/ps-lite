@@ -267,10 +267,6 @@ class RDMATransport : public Transport {
       data_len += length;
     }
 
-    LOG(INFO) << "RDMAWriteWithImm: remote_addr=" << remote_addr
-              << ", idx=" << idx
-              << ", len=" << data_len;
-
     WRContext *write_ctx = msg_buf->reserved_context;
     CHECK(write_ctx);
     MessageBuffer **tmp =
@@ -414,20 +410,6 @@ class RDMATransport : public Transport {
       msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
       msg.meta.val_len = vals.size();
       msg.meta.option = mem_mr_map_[vals.data()]->rkey;
-    } else if (!msg.meta.push && !msg.meta.request) {
-      // pull response
-      uint64_t key = msg.meta.key;
-      auto recver = msg.meta.recver;
-
-      std::lock_guard<std::mutex> lock(map_mu_);
-      CHECK_NE(key_meta_map_.find(key), key_meta_map_.end())
-          << "key=" << key << " not inited in key_meta_map";
-      CHECK_NE(key_meta_map_[key].find(recver), key_meta_map_[key].end())
-          << "key=" << key << ", recver=" << recver << " not inited in key_meta_map[key]";
-
-      msg.meta.val_len = std::get<0>(key_meta_map_[key][recver]);
-      msg.meta.addr = std::get<1>(key_meta_map_[key][recver]);
-      msg.meta.option = std::get<2>(key_meta_map_[key][recver]);
     }
   }
 
@@ -461,9 +443,9 @@ class RDMATransport : public Transport {
     std::lock_guard<std::mutex> lock(map_mu_);
     auto key = msg.meta.key;
     auto recver = msg.meta.recver;
-    auto len = std::get<0>(key_meta_map_[key][recver]);
-    auto raddr = std::get<1>(key_meta_map_[key][recver]);
-    auto rkey = std::get<2>(key_meta_map_[key][recver]);
+    auto len = msg.meta.val_len;
+    auto raddr = msg.meta.addr;
+    auto rkey = msg.meta.option;
 
     auto temp_mr = mem_mr_map_.find(msg_buf->data[1].data());
     CHECK_NE(temp_mr, mem_mr_map_.end());
@@ -530,24 +512,7 @@ class RDMATransport : public Transport {
   }
 
   virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    int total_data_len = Recv(msg, buffer_ctx, meta_len);
-
-    auto key = msg->meta.key;
-    auto len = msg->meta.val_len;
-    auto addr = msg->meta.addr;
-    auto rkey = msg->meta.option;
-    auto sender = msg->meta.sender;
-
-    std::lock_guard<std::mutex> lock(map_mu_);
-    if (key_meta_map_.find(key) == key_meta_map_.end()
-          || key_meta_map_[key].find(sender) == key_meta_map_[key].end()) {
-      key_meta_map_[key][sender] = std::make_tuple(len, addr, rkey);
-    } else {
-      CHECK_EQ(len, std::get<0>(key_meta_map_[key][sender]));
-      CHECK_EQ(addr, std::get<1>(key_meta_map_[key][sender]));
-      CHECK_EQ(rkey, std::get<2>(key_meta_map_[key][sender]));
-    }
-    return total_data_len;
+    return Recv(msg, buffer_ctx, meta_len);
   }
 
  private:
@@ -560,7 +525,6 @@ class RDMATransport : public Transport {
 
     int total_data_len = 0;
     char *cur = buffer_ctx->buffer + meta_len; // offset
-    LOG(INFO) << "meta_len=" << meta_len;
 
     for (size_t i = 0; i < data_num; i++) {
       uint32_t len = buffer_ctx->data_len[i];
@@ -594,10 +558,6 @@ class RDMATransport : public Transport {
   std::unordered_map<ps::Key, ps::Key> key_addr_map_;
   std::unordered_map<ps::Key, int> key_len_map_;
 
-  using MetaInfo = std::tuple<int, uint64_t, int>; // len, addr, rkey
-  using SenderMeta = std::unordered_map<int, MetaInfo>; // sender as the key
-  std::unordered_map<ps::Key, SenderMeta> key_meta_map_; // (key, sender) --> MetaInfo
-  
 }; // class Transport
 
 

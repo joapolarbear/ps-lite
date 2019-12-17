@@ -221,6 +221,41 @@ class RDMAVan : public Van {
     }
   }
 
+  void PackWorkerTensorAddress(Message &msg) {
+    // must be pull response
+    if (msg.meta.push || msg.meta.request) return;
+    
+    uint64_t key = msg.meta.key;
+    auto recver = msg.meta.recver;
+
+    std::lock_guard<std::mutex> lock(info_mu_);
+    CHECK_NE(tensor_info_map_.find(key), tensor_info_map_.end())
+        << "key=" << key << " not inited in tensor_info_map_";
+    CHECK_NE(tensor_info_map_[key].find(recver), tensor_info_map_[key].end())
+        << "key=" << key << ", recver=" << recver << " not inited in tensor_info_map_[key]";
+    msg.meta.val_len = std::get<0>(tensor_info_map_[key][recver]);
+    msg.meta.addr = std::get<1>(tensor_info_map_[key][recver]);
+    msg.meta.option = std::get<2>(tensor_info_map_[key][recver]);
+  }
+
+  void StoreWorkerTensorAddress(Message *msg) {
+    auto key = msg->meta.key;
+    auto len = msg->meta.val_len;
+    auto addr = msg->meta.addr;
+    auto rkey = msg->meta.option;
+    auto sender = msg->meta.sender;
+
+    std::lock_guard<std::mutex> lock(info_mu_);
+    if (tensor_info_map_.find(key) == tensor_info_map_.end()
+          || tensor_info_map_[key].find(sender) == tensor_info_map_[key].end()) {
+      tensor_info_map_[key][sender] = std::make_tuple(len, addr, rkey);
+    } else {
+      CHECK_EQ(len, std::get<0>(tensor_info_map_[key][sender]));
+      CHECK_EQ(addr, std::get<1>(tensor_info_map_[key][sender]));
+      CHECK_EQ(rkey, std::get<2>(tensor_info_map_[key][sender]));
+    }
+  }
+
   int SendMsg(Message &msg) override {
     int remote_id = msg.meta.recver;
     CHECK_NE(remote_id, Meta::kEmpty);
@@ -242,10 +277,10 @@ class RDMAVan : public Van {
     msg_buf->inline_buf = mempool_->Alloc(meta_len);
     msg_buf->data = msg.data;
 
-    LOG(INFO) << "Send a message with meta_len=" << meta_len 
-              << ", total_len=" << total_len;
-
-    if (IsValidPushpull(msg)) trans->AddMeta(msg);
+    if (IsValidPushpull(msg)) {
+      trans->AddMeta(msg);
+      PackWorkerTensorAddress(msg);
+    }
 
     PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
 
@@ -301,15 +336,10 @@ class RDMAVan : public Van {
     msg->meta.recver = my_node_.id;
     msg->meta.sender = endpoint->node_id;
 
-    LOG(INFO) << "RecvMsg meta_len=" << buffer_ctx->meta_len
-              << ", buffer addr=" << reinterpret_cast<uint64_t>(buffer_ctx->buffer);
-
     // the second argument is actually deprecated, 
     // we keep it as is in order to be compatible    
     UnpackMeta(buffer_ctx->buffer, buffer_ctx->meta_len, &msg->meta); 
     int meta_len = GetPackMetaLen(msg->meta);
-
-    LOG(INFO) << "receive a message with meta_len=" << meta_len;
 
     int total_len = 0;
     total_len += meta_len;
@@ -327,6 +357,7 @@ class RDMAVan : public Van {
       // push request
       LOG(INFO) << "recv push request";
       total_len += trans->RecvPushRequest(msg, buffer_ctx, meta_len);
+      StoreWorkerTensorAddress(msg);
     } else if (!msg->meta.push && msg->meta.request) { 
       // pull request
       LOG(INFO) << "recv pull request";
@@ -418,9 +449,6 @@ class RDMAVan : public Van {
           case IBV_WC_RECV_RDMA_WITH_IMM: {
             uint32_t addr_idx = wc[i].imm_data;
             BufferContext *buf_ctx = addr_pool_.GetAddress(addr_idx);
-            LOG(INFO) << "------- receving RDMA_WITH_IMM with idx=" << addr_idx
-                      << " bufctx=" << reinterpret_cast<uint64_t>(buf_ctx)
-                      << " buffer=" << reinterpret_cast<uint64_t>(buf_ctx->buffer);
             recv_buffers_.Push(std::make_tuple(endpoint, buf_ctx));
             ReleaseWorkRequestContext(context, endpoint);
           } break;
@@ -681,6 +709,12 @@ class RDMAVan : public Van {
   bool disable_ipc_ = false;
   std::mutex local_mu_;
   std::unordered_map<int, bool> is_local_;
+
+  // to store worker's tensor address
+  std::mutex info_mu_;
+  using RemoteInfo = std::tuple<int, uint64_t, int>; // len, addr, rkey
+  using SenderMeta = std::unordered_map<int, RemoteInfo>; // sender as the key
+  std::unordered_map<ps::Key, SenderMeta> tensor_info_map_; // (key, sender) --> RemoteInfo
 
 };  // class RDMAVan
 

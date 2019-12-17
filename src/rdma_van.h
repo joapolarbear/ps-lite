@@ -265,7 +265,7 @@ class RDMAVan : public Van {
         return total_len;
       }
     }
-    
+
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
       // worker, push request
@@ -301,8 +301,10 @@ class RDMAVan : public Van {
     msg->meta.recver = my_node_.id;
     msg->meta.sender = endpoint->node_id;
 
+    LOG(INFO) << "RecvMsg meta_len=" << buffer_ctx->meta_len;
+
     // the second argument is actually deprecated, 
-    // we keep it as is in order to be compatible
+    // we keep it as is in order to be compatible    
     UnpackMeta(buffer_ctx->buffer, buffer_ctx->meta_len, &msg->meta); 
     int meta_len = GetPackMetaLen(msg->meta);
 
@@ -411,13 +413,13 @@ class RDMAVan : public Van {
                 *reinterpret_cast<MessageBuffer **>(context->buffer->addr);
             mempool_->Free(msg_buf->inline_buf);
             delete msg_buf;
-            // ReleaseWorkRequestContext(context, endpoint);
+            ReleaseWorkRequestContext(context, endpoint);
           } break;
           case IBV_WC_RECV_RDMA_WITH_IMM: {
             uint32_t addr_idx = wc[i].imm_data;
             BufferContext *buf_ctx = addr_pool_.GetAddress(addr_idx);
             recv_buffers_.Push(std::make_tuple(endpoint, buf_ctx));
-            // ReleaseWorkRequestContext(context, endpoint);
+            ReleaseWorkRequestContext(context, endpoint);
           } break;
           case IBV_WC_RECV: {
             CHECK(wc[i].wc_flags & IBV_WC_WITH_IMM);

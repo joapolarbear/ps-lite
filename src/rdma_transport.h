@@ -246,6 +246,8 @@ class RDMATransport : public Transport {
   }
 
   void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
+    LOG(INFO) << "RDMAWriteWithImm: remote_addr=" << remote_addr
+              << ", idx=" << idx;
     // prepare RDMA write sge list
     struct ibv_sge sge[1 + msg_buf->mrs.size()];
     sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
@@ -424,11 +426,16 @@ class RDMATransport : public Transport {
   }
 
   void Send(Message &msg, MessageBuffer *msg_buf, bool is_push) {
+    WRContext *reserved = nullptr;
+    endpoint_->free_write_ctx.WaitAndPop(&reserved);
+    msg_buf->reserved_context = reserved;
     auto key = DecodeKey(msg_buf->data[0]);
+
     std::lock_guard<std::mutex> lk(addr_mu_);
     auto remote_addr = is_push ? std::get<0>(push_addr_[key]) : std::get<0>(pull_addr_[key]);
     auto rkey = is_push ? std::get<1>(push_addr_[key]) : std::get<1>(pull_addr_[key]);
     auto idx = is_push ? std::get<2>(push_addr_[key]) : std::get<2>(pull_addr_[key]);
+
     RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
   }
 
@@ -513,7 +520,6 @@ class RDMATransport : public Transport {
     msg->data.push_back(lens);
     total_data_len += keys.size() + vals.size() + lens.size();
 
-    mempool_->Free(buffer_ctx->buffer);
     return total_data_len;
   }
 
@@ -544,7 +550,7 @@ class RDMATransport : public Transport {
     if (data_num == 0) {
       mempool_->Free(buffer_ctx->buffer);
       return 0;
-    }    
+    }
 
     int total_data_len = 0;
     char *cur = buffer_ctx->buffer + meta_len; // offset

@@ -7,8 +7,9 @@ using namespace ps;
 
 enum MODE {
     PUSH_THEN_PULL = 0,
-    PUSH_PULL_MIX_ENDLESS = 1,
-    PUSH_ONLY = 2
+    PUSH_PULL = 1,
+    PUSH_ONLY = 2, 
+    PULL_ONLY = 3
 };
 std::unordered_map<uint64_t, KVPairs<float> > mem_map;
 
@@ -52,6 +53,70 @@ struct PSKV {
 };
 std::unordered_map<uint64_t, PSKV> ps_kv_;
 
+void push_pull(KVWorker<float> &kv, std::vector<SArray<float> > &server_vals, 
+      int len, int num_servers, int total_key_num, int how_many_key_per_server, MODE mode) {
+  CHECK_GT(mode, 0);
+  switch (mode) {
+    case PUSH_PULL: 
+      LOG(INFO) << "========= PUSH_PULL mode =========";
+      break;
+    case PUSH_ONLY: 
+      LOG(INFO) << "========= PUSH_ONLY mode =========";
+       break;
+    case PULL_ONLY: 
+      LOG(INFO) << "========= PULL_ONLY mode =========";
+      break;
+    default: CHECK(0);
+  }
+
+  std::vector<int> timestamp_list;
+  auto start = std::chrono::high_resolution_clock::now();
+  auto end = std::chrono::high_resolution_clock::now();
+  
+  auto val = Environment::Get()->find("LOG_DURATION");
+  unsigned int log_duration = val ? atoi(val) : 10;
+  
+  int cnt = 0;
+  while (1) {
+    for (int key = 0; key < total_key_num; key++) {
+      PSKV& pskv = ps_kv_[key];
+      auto keys = pskv.keys;
+      auto lens = pskv.lens;
+      auto vals = server_vals[key];
+
+      switch (mode) {
+        case PUSH_PULL: {
+          timestamp_list.push_back(kv.ZPush(keys, vals, lens));
+          timestamp_list.push_back(kv.ZPull(keys, &vals, &lens));
+        } break;
+        case PUSH_ONLY: {
+          timestamp_list.push_back(kv.ZPush(keys, vals, lens));
+        } break;
+        case PULL_ONLY: {
+          timestamp_list.push_back(kv.ZPull(keys, &vals, &lens));
+        } break;
+        default: {
+          CHECK(0);
+          break;
+        } 
+      }
+    }
+
+    for (auto& ts : timestamp_list) { kv.Wait(ts); }
+    timestamp_list.clear();
+    
+    cnt++;
+    if (cnt % log_duration != 0) continue;
+
+    end = std::chrono::high_resolution_clock::now();
+    LL << "Application goodput: " 
+        << 8.0 * len * sizeof(float) * total_key_num * cnt / (end - start).count() 
+        << " Gbps";
+    cnt = 0;
+    start = std::chrono::high_resolution_clock::now();
+  }
+}
+
 void RunWorker(int argc, char *argv[]) {
   if (!IsWorker()) return;
   CHECK_GE(argc, 3) << "input argument should be at least 3: SCRIPT, LEN, REPEAT, (OPTIONAL) MODE";
@@ -65,21 +130,27 @@ void RunWorker(int argc, char *argv[]) {
   // init
   int len = atoi(argv[1]);
   int repeat = atoi(argv[2]);
-  MODE mode = (argc > 3) ? static_cast<MODE>(atoi(argv[3])) : PUSH_PULL_MIX_ENDLESS;
+  MODE mode = (argc > 3) ? static_cast<MODE>(atoi(argv[3])) : PUSH_PULL;
+
+  auto v = Environment::Get()->find("NUM_KEY_PER_SERVER");
+  const int how_many_key_per_server = v ? atoi(v) : 10;
+  const int total_key_num = num_servers * how_many_key_per_server;
 
   std::vector<SArray<float> > server_vals;
-  for (int server = 0; server < num_servers; server++) {
+  for (int key = 0; key < total_key_num; key++) {
     std::vector<float> vec(len);
     SArray<float> vals(vec);
     server_vals.push_back(vals);
   }
 
-  // init push, do not count this into time cos
-  for (int server = 0; server < num_servers; server++) {
-    int key = server; // could be other value
-    auto vals = server_vals[server];
+  // init push, do not count this into time cost
+  for (int key = 0; key < total_key_num; key++) {
+    auto vals = server_vals[key];
     PSKV& pskv = ps_kv_[key];
     SArray<Key> keys;
+
+    int server = key % num_servers;
+    LOG(INFO) << "key=" << key << " assigned to server " << server;
     ps::Key ps_key = krs[server].begin() + key;
     keys.push_back(ps_key);
     SArray<int> lens;
@@ -92,128 +163,55 @@ void RunWorker(int argc, char *argv[]) {
 
   switch(mode) {
     case PUSH_THEN_PULL: {
-        LOG(INFO) << "PUSH_THEN_PULL mode";
-        // push
-        uint64_t accumulated_ms = 0;
-        for (int i = 0; i < repeat; ++i) {
-          auto start = std::chrono::high_resolution_clock::now();
-          for (int server = 0; server < num_servers; server++) {
-            int key = server;
-            PSKV& pskv = ps_kv_[key];
-            auto keys = pskv.keys;
-            auto lens = pskv.lens;
-            auto vals = server_vals[server];
+      LOG(INFO) << "PUSH_THEN_PULL mode";
+      // push
+      uint64_t accumulated_ms = 0;
+      for (int i = 0; i < repeat; ++i) {
+        auto start = std::chrono::high_resolution_clock::now();
+        for (int server = 0; server < num_servers; server++) {
+          int key = server;
+          PSKV& pskv = ps_kv_[key];
+          auto keys = pskv.keys;
+          auto lens = pskv.lens;
+          auto vals = server_vals[server];
 
-            kv.Wait(kv.ZPush(keys, vals, lens));
-          }
-          auto end = std::chrono::high_resolution_clock::now();
-          accumulated_ms += (end - start).count(); // ns
+          kv.Wait(kv.ZPush(keys, vals, lens));
         }
-        LL << "push " << len * sizeof(float)
-           << " bytes to each server, repeat=" << repeat
-           << ", total_time="
-           << accumulated_ms / 1e6 << "ms";
-
-        // pull
-        accumulated_ms = 0;
-        for (int i = 0; i < repeat; ++i) {
-          auto start = std::chrono::high_resolution_clock::now();
-          for (int server = 0; server < num_servers; server++) {
-            int key = server;
-            PSKV& pskv = ps_kv_[key];
-            auto keys = pskv.keys;
-            auto lens = pskv.lens;
-            auto vals = server_vals[server];
-
-            kv.Wait(kv.ZPull(keys, &vals, &lens));
-          }
-          auto end = std::chrono::high_resolution_clock::now();
-          accumulated_ms += (end - start).count(); // ns
-        }
-
-        LL << "pull " << len * sizeof(float)
-           << " bytes to each server, repeat=" << repeat
-           << ", total_time="
-           << accumulated_ms / 1e6 << "ms";
+        auto end = std::chrono::high_resolution_clock::now();
+        accumulated_ms += (end - start).count(); // ns
       }
-      break;
+      LL << "push " << len * sizeof(float)
+          << " bytes to each server, repeat=" << repeat
+          << ", total_time="
+          << accumulated_ms / 1e6 << "ms";
 
-    case PUSH_PULL_MIX_ENDLESS: {
-        LOG(INFO) << "PUSH_PULL_MIX_ENDLESS mode, should exit by Ctrl+C";
-        std::vector<int> timestamp_list;
+      // pull
+      accumulated_ms = 0;
+      for (int i = 0; i < repeat; ++i) {
         auto start = std::chrono::high_resolution_clock::now();
-        auto end = std::chrono::high_resolution_clock::now();
-        auto val = Environment::Get()->find("THRESHOLD");
-        unsigned int threshold = val ? atoi(val) : 1;
-        val = Environment::Get()->find("LOG_DURATION");
-        unsigned int log_duration = val ? atoi(val) : 50;
-        int cnt = 0;
-        while (1) {
-          for (int server = 0; server < num_servers; server++) {
-            int key = server;
-            PSKV& pskv = ps_kv_[key];
-            auto keys = pskv.keys;
-            auto lens = pskv.lens;
-            auto vals = server_vals[server];
+        for (int server = 0; server < num_servers; server++) {
+          int key = server;
+          PSKV& pskv = ps_kv_[key];
+          auto keys = pskv.keys;
+          auto lens = pskv.lens;
+          auto vals = server_vals[server];
 
-            timestamp_list.push_back(kv.ZPush(keys, vals, lens));
-            timestamp_list.push_back(kv.ZPull(keys, &vals, &lens));
-          }
-          if (timestamp_list.size()/2/num_servers >= threshold) { // flow control
-            for (auto& ts : timestamp_list) {
-              kv.Wait(ts);
-            }
-            timestamp_list.clear();
-            cnt++;
-            if (cnt % log_duration == 0) {
-              end = std::chrono::high_resolution_clock::now();
-              LL << "Application goodput: " 
-                 << 8.0 * len * sizeof(float) * num_servers * cnt * threshold / (end - start).count() 
-                 << " Gbps";
-              cnt = 0;
-              start = std::chrono::high_resolution_clock::now();
-            }
-          }
+          kv.Wait(kv.ZPull(keys, &vals, &lens));
         }
-      } break;
-    case PUSH_ONLY: {
-        LOG(INFO) << "PUSH_ONLY mode, should exit by Ctrl+C";
-        std::vector<int> timestamp_list;
-        auto start = std::chrono::high_resolution_clock::now();
         auto end = std::chrono::high_resolution_clock::now();
-        auto val = Environment::Get()->find("THRESHOLD");
-        unsigned int threshold = val ? atoi(val) : 1;
-        val = Environment::Get()->find("LOG_DURATION");
-        unsigned int log_duration = val ? atoi(val) : 50;
-        int cnt = 0;
-        while (1) {
-          for (int server = 0; server < num_servers; server++) {
-            int key = server;
-            PSKV& pskv = ps_kv_[key];
-            auto keys = pskv.keys;
-            auto lens = pskv.lens;
-            auto vals = server_vals[server];
+        accumulated_ms += (end - start).count(); // ns
+      }
 
-            timestamp_list.push_back(kv.ZPush(keys, vals, lens));
-          }
-          if (timestamp_list.size()/num_servers >= threshold) { // flow control
-            for (auto& ts : timestamp_list) {
-              kv.Wait(ts);
-            }
-            timestamp_list.clear();
-            cnt++;
-            if (cnt % log_duration == 0) {
-              end = std::chrono::high_resolution_clock::now();
-              LL << "Application goodput: " 
-                 << 8.0 * len * sizeof(float) * num_servers * cnt * threshold / (end - start).count() 
-                 << " Gbps";
-              cnt = 0;
-              start = std::chrono::high_resolution_clock::now();
-            }
-          }
-        }
+      LL << "pull " << len * sizeof(float)
+          << " bytes to each server, repeat=" << repeat
+          << ", total_time="
+          << accumulated_ms / 1e6 << "ms";
     } break;
-
+    case PUSH_PULL: 
+    case PUSH_ONLY: 
+    case PULL_ONLY: 
+      push_pull(kv, server_vals, len, num_servers, total_key_num, how_many_key_per_server, mode);
+      break;
     default:
       CHECK(0) << "unknown mode " << mode;
   }

@@ -252,13 +252,26 @@ class RDMATransport : public Transport {
     size_t num_sge = 1;
     
     uint64_t data_len = 0;
-    if (msg_buf->mrs.size() == 3) { 
-      // push request, only write vals
-      sge[1].addr = reinterpret_cast<uint64_t>(msg_buf->mrs[1].first->addr);
-      sge[1].length = msg_buf->mrs[1].second;
-      sge[1].lkey = msg_buf->mrs[1].first->lkey;
-      ++num_sge;
-      data_len += sge[1].length;
+    if (msg_buf->mrs.size() == 3) {
+      struct ibv_sge my_sge;
+      my_sge.addr = reinterpret_cast<uint64_t>(msg_buf->mrs[1].first->addr);
+      my_sge.length = msg_buf->mrs[1].second;
+      my_sge.lkey = msg_buf->mrs[1].first->lkey;
+
+      // this rdma-write will not trigger any signal both remotely and locally
+      struct ibv_send_wr wr, *bad_wr = nullptr;
+      memset(&wr, 0, sizeof(wr));
+      wr.wr_id = 0;
+      wr.opcode = IBV_WR_RDMA_WRITE;
+      wr.next = nullptr;
+      wr.sg_list = &my_sge;
+      wr.num_sge = 1;
+      wr.wr.rdma.remote_addr = remote_addr + msg_buf->inline_len;
+      wr.wr.rdma.rkey = rkey;
+
+      CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
+        << "ibv_post_send failed.";
+
     } else {
       for (auto &pair : msg_buf->mrs) {
         size_t length = pair.second;      

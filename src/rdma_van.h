@@ -67,7 +67,8 @@ class RDMAVan : public Van {
     cm_event_polling_thread_.reset();
 
     PS_VLOG(1) << "Clearing mempool.";
-    mempool_.reset();
+    send_mempool_.reset();
+    recv_mempool_.reset();
 
     PS_VLOG(1) << "Clearing endpoints.";
     incoming_.clear();
@@ -213,8 +214,8 @@ class RDMAVan : public Van {
       }
 
       std::shared_ptr<Transport> t = is_local_[node.id] ?
-          std::make_shared<IPCTransport>(endpoint, mempool_.get()) :
-          std::make_shared<RDMATransport>(endpoint, mempool_.get());
+          std::make_shared<IPCTransport>(endpoint, send_mempool_.get()) :
+          std::make_shared<RDMATransport>(endpoint, send_mempool_.get());
       endpoint->SetTransport(t);
 
       freeaddrinfo(remote_addr);
@@ -298,7 +299,7 @@ class RDMAVan : public Van {
     CHECK(meta_len);
 
     msg_buf->inline_len = meta_len;
-    msg_buf->inline_buf = mempool_->Alloc(meta_len);
+    msg_buf->inline_buf = send_mempool_->Alloc(meta_len);
     msg_buf->data = msg.data;
 
     if (IsValidPushpull(msg)) {
@@ -374,7 +375,7 @@ class RDMAVan : public Van {
     auto trans = CHECK_NOTNULL(endpoint->GetTransport());
 
     if (!IsValidPushpull(*msg)) {
-      mempool_->Free(buffer_ctx->buffer);
+      recv_mempool_->Free(buffer_ctx->buffer);
       delete buffer_ctx;
       return total_len;
     }
@@ -412,7 +413,8 @@ class RDMAVan : public Van {
     pd_ = ibv_alloc_pd(context_);
     CHECK(pd_) << "Failed to allocate protection domain";
 
-    mempool_.reset(new SimpleMempool(pd_));
+    send_mempool_.reset(new SimpleMempool(pd_));
+    recv_mempool_.reset(new SimpleMempool(pd_));
 
     comp_event_channel_ = ibv_create_comp_channel(context_);
 
@@ -463,13 +465,12 @@ class RDMAVan : public Van {
 
         switch (wc[i].opcode) {
           case IBV_WC_SEND:
-            // LOG(INFO) << "opcode: IBV_WC_SEND";
             ReleaseWorkRequestContext(context, endpoint);
             break;
           case IBV_WC_RDMA_WRITE: {
             MessageBuffer *msg_buf =
                 *reinterpret_cast<MessageBuffer **>(context->buffer->addr);
-            mempool_->Free(msg_buf->inline_buf);
+            send_mempool_->Free(msg_buf->inline_buf);
             delete msg_buf;
             ReleaseWorkRequestContext(context, endpoint);
           } break;
@@ -609,8 +610,8 @@ class RDMAVan : public Van {
     endpoint->Init(cq_, pd_);
 
     std::shared_ptr<Transport> t = is_local_[remote_ctx->node] ?
-        std::make_shared<IPCTransport>(endpoint, mempool_.get()) :
-        std::make_shared<RDMATransport>(endpoint, mempool_.get());
+        std::make_shared<IPCTransport>(endpoint, recv_mempool_.get()) :
+        std::make_shared<RDMATransport>(endpoint, recv_mempool_.get());
     endpoint->SetTransport(t);
 
     RequestContext ctx;
@@ -696,7 +697,8 @@ class RDMAVan : public Van {
   }
 
   AddressPool<BufferContext> addr_pool_;
-  std::unique_ptr<SimpleMempool> mempool_;
+  std::unique_ptr<SimpleMempool> recv_mempool_;
+  std::unique_ptr<SimpleMempool> send_mempool_;
 
   std::unique_ptr<RDMATransport> rdma_trans_;
   std::unique_ptr<IPCTransport> ipc_trans_;

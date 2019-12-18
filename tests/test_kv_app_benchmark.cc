@@ -22,7 +22,7 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
         << "key=" << key << ", " << req_data.vals.size() << ", " << req_data.lens[0];
 
     if (mem_map.find(key) == mem_map.end()) {
-      PS_VLOG(1) << "key " << key << " from worker-" << req_meta.sender;
+      PS_VLOG(1) << "receive key-" << key << " from worker-" << req_meta.sender;
       size_t len = (size_t) req_data.vals.size();
       mem_map[key].keys.push_back(key);
       mem_map[key].vals.CopyFrom(req_data.vals);
@@ -150,7 +150,7 @@ void RunWorker(int argc, char *argv[]) {
     SArray<Key> keys;
 
     int server = key % num_servers;
-    LOG(INFO) << "key=" << key << " assigned to server " << server;
+    PS_VLOG(1) << "key=" << key << " assigned to server " << server;
     ps::Key ps_key = krs[server].begin() + key;
     keys.push_back(ps_key);
     SArray<int> lens;

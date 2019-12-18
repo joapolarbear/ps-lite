@@ -210,6 +210,7 @@ class RDMATransport : public Transport {
     auto val = Environment::Get()->find("DMLC_ROLE");
     std::string role(val);
     is_server_ = (role=="server");
+    pagesize_ = sysconf(_SC_PAGESIZE);
   };
 
   ~RDMATransport() {
@@ -252,7 +253,8 @@ class RDMATransport : public Transport {
     size_t num_sge = 1;
     
     uint64_t data_len = 0;
-    if (msg_buf->mrs.size() == 3) {
+    if (msg_buf->mrs.size() == 3) { 
+      // push request, split the meta and data into two writes
       struct ibv_sge my_sge;
       my_sge.addr = reinterpret_cast<uint64_t>(msg_buf->mrs[1].first->addr);
       my_sge.length = msg_buf->mrs[1].second;
@@ -266,7 +268,7 @@ class RDMATransport : public Transport {
       wr.next = nullptr;
       wr.sg_list = &my_sge;
       wr.num_sge = 1;
-      wr.wr.rdma.remote_addr = remote_addr + msg_buf->inline_len;
+      wr.wr.rdma.remote_addr = remote_addr + align_ceil(msg_buf->inline_len, pagesize_);
       wr.wr.rdma.rkey = rkey;
 
       CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
@@ -524,6 +526,8 @@ class RDMATransport : public Transport {
     if (msg->meta.push && msg->meta.request) { // push request
       CHECK_EQ(data_num, 3);
       uint32_t len = buffer_ctx->data_len[1];
+
+      cur = buffer_ctx->buffer + align_ceil((size_t)meta_len, pagesize_);
       
       SArray<char> keys;
       void *p = malloc(sizeof(Key));
@@ -558,6 +562,7 @@ class RDMATransport : public Transport {
   }
  
  protected:
+  size_t pagesize_ = 4096;
   Endpoint *endpoint_;
   SimpleMempool *mempool_;
   // role is server or worker

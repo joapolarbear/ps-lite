@@ -77,12 +77,15 @@ void push_pull(KVWorker<char> &kv, std::vector<SArray<char> > &server_vals,
   switch (mode) {
     case PUSH_PULL: 
       LOG(INFO) << "========= PUSH_PULL mode =========";
+      LOG(INFO) << "========= msg_size=" << len*sizeof(char) << " bytes =========";
       break;
     case PUSH_ONLY: 
       LOG(INFO) << "========= PUSH_ONLY mode =========";
+      LOG(INFO) << "========= msg_size=" << len*sizeof(char) << " bytes =========";
        break;
     case PULL_ONLY: 
       LOG(INFO) << "========= PULL_ONLY mode =========";
+      LOG(INFO) << "========= msg_size=" << len*sizeof(char) << " bytes =========";
       break;
     default: CHECK(0);
   }
@@ -156,7 +159,6 @@ void RunWorker(int argc, char *argv[]) {
 
   std::vector<SArray<char> > server_vals;
   for (int key = 0; key < total_key_num; key++) {
-    std::vector<char> vec(len);
     void* ptr;
     aligned_memory_alloc(&ptr, len);
     SArray<char> vals;

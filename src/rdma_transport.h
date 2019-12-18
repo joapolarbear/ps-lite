@@ -252,16 +252,25 @@ class RDMATransport : public Transport {
     size_t num_sge = 1;
     
     uint64_t data_len = 0;
-    for (auto &pair : msg_buf->mrs) {
-      size_t length = pair.second;      
-      CHECK(length);
-      sge[num_sge].addr =
-          reinterpret_cast<uint64_t>(pair.first->addr);
-      sge[num_sge].length = length;
-      sge[num_sge].lkey = pair.first->lkey;
+    if (msg_buf->mrs.size() == 3) { 
+      // push request, only write vals
+      sge[1].addr = reinterpret_cast<uint64_t>(msg_buf->mrs[1].first->addr);
+      sge[1].length = msg_buf->mrs[1].second;
+      sge[1].lkey = msg_buf->mrs[1].first->lkey;
       ++num_sge;
-      
-      data_len += length;
+      data_len += sge[1].length;
+    } else {
+      for (auto &pair : msg_buf->mrs) {
+        size_t length = pair.second;      
+        CHECK(length);
+        sge[num_sge].addr =
+            reinterpret_cast<uint64_t>(pair.first->addr);
+        sge[num_sge].length = length;
+        sge[num_sge].lkey = pair.first->lkey;
+        ++num_sge;
+        
+        data_len += length;
+      }
     }
 
     WRContext *write_ctx = msg_buf->reserved_context;
@@ -459,6 +468,7 @@ class RDMATransport : public Transport {
     std::lock_guard<std::mutex> lock(map_mu_);
     auto key = msg->meta.key;
     if (key_len_map_.find(key) == key_len_map_.end()) {
+      // need a static address for keys/lens
       key_addr_map_[key] = (ps::Key) key;
       key_len_map_[key] = (int) msg->meta.val_len;
     }
@@ -496,9 +506,33 @@ class RDMATransport : public Transport {
       return 0;
     }
 
-    int total_data_len = 0;
     char *cur = buffer_ctx->buffer + meta_len; // offset
 
+    if (msg->meta.push && msg->meta.request) { // push request
+      CHECK_EQ(data_num, 3);
+      uint32_t len = buffer_ctx->data_len[1];
+      
+      SArray<char> keys;
+      void *p = malloc(sizeof(Key));
+      memcpy(p, &msg->meta.key, sizeof(Key));
+      keys.reset((char *) p, sizeof(Key), [p](void *) { free(p); });
+
+      SArray<char> vals;
+      vals.reset(cur, len, [](void *) {});  // no need to delete
+
+      SArray<char> lens;
+      void *q = malloc(sizeof(int));
+      memcpy(q, &len, sizeof(int));
+      lens.reset((char *) q, sizeof(int), [q](void *) { free(q); });
+
+      msg->data.push_back(keys);
+      msg->data.push_back(vals);
+      msg->data.push_back(lens);
+
+      return sizeof(Key) + len + sizeof(int);
+    }
+
+    int total_data_len = 0;
     for (size_t i = 0; i < data_num; i++) {
       uint32_t len = buffer_ctx->data_len[i];
       SArray<char> data;
@@ -507,7 +541,6 @@ class RDMATransport : public Transport {
       cur += len;
       total_data_len += len;
     }
-
     return total_data_len;
   }
  

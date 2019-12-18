@@ -67,7 +67,6 @@ static const int kMaxConcurrentWorkRequest =
     kRxDepth + kStartDepth + kReplyDepth + kWriteDepth;
 static const int kMaxHostnameLength = 16;
 static const int kMaxDataFields = 4;
-static const size_t kAlignment = 8;
 
 static const int kMaxResolveRetry = 50000;
 static const int kBasePort = 9010;
@@ -105,6 +104,8 @@ class SimpleMempool {
     std::lock_guard<std::mutex> lk(mu_);
     pd_ = pd;
     struct ibv_mr *mr;
+
+    pagesize_ = sysconf(_SC_PAGESIZE);
     
     // set init mempool size
     auto byteps_rdma_mempool_size = Environment::Get()->find("BYTEPS_RDMA_MEMPOOL_SIZE");
@@ -141,11 +142,13 @@ class SimpleMempool {
 
     std::lock_guard<std::mutex> lk(mu_);
 
-    size_t proper_size = align_ceil(size, kAlignment);
+    // use page aligned memory
+    size_t proper_size = align_ceil(size, pagesize_);
 
     auto it = free_list.lower_bound(proper_size);
 
-    if (it == free_list.end()) { // if there is no space left, need to allocate and register new memory
+    // if there is no space left, need to allocate and register new memory
+    if (it == free_list.end()) { 
       size_t new_mem_size = total_allocated_size;
       while (proper_size > new_mem_size) {
         new_mem_size *= 2;
@@ -227,6 +230,8 @@ class SimpleMempool {
     CHECK_NE(it, mr_list.end()) << "cannot find the associated memory region";
     return it->second;
   }
+
+  size_t pagesize_;
 
 };
 

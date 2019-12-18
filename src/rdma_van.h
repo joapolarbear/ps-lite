@@ -281,6 +281,11 @@ class RDMAVan : public Van {
     msgbuf_cache_.erase(buf);
   }
 
+  RemoteAddress GetRemoteInfo(uint64_t key, bool is_push) {
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    return (is_push ? push_addr_[key] : pull_addr_[key]);
+  }
+
   int SendMsg(Message &msg) override {
     int remote_id = msg.meta.recver;
     CHECK_NE(remote_id, Meta::kEmpty);
@@ -325,9 +330,7 @@ class RDMAVan : public Van {
       }
     }
 
-    std::lock_guard<std::mutex> lk(addr_mu_);
-    auto key = msg.meta.key;
-    auto remote_addr_tuple = (msg.meta.push ? push_addr_[key] : pull_addr_[key]);
+    auto remote_addr_tuple = GetRemoteInfo(msg.meta.key, msg.meta.push);
 
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 

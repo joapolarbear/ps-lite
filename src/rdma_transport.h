@@ -426,12 +426,12 @@ class RDMATransport : public Transport {
     sge.length = msg_buf->data[1].size();
     sge.lkey = temp_mr->second->lkey;
 
+    // this rdma-write will not trigger any signal both remotely and locally
     struct ibv_send_wr wr, *bad_wr = nullptr;
     memset(&wr, 0, sizeof(wr));
     wr.wr_id = reinterpret_cast<uint64_t>(raddr);
     wr.opcode = IBV_WR_RDMA_WRITE;
     wr.next = nullptr;
-    // wr.send_flags = IBV_SEND_SIGNALED;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.wr.rdma.remote_addr = raddr;

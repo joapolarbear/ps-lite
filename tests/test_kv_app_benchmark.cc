@@ -1,7 +1,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
+#include <unistd.h>
 #include "ps/ps.h"
+
+#define DIVUP(x, y) (((x)+(y)-1)/(y))
+#define ROUNDUP(x, y) (DIVUP((x), (y))*(y))
 
 using namespace ps;
 
@@ -11,7 +15,18 @@ enum MODE {
     PUSH_ONLY = 2, 
     PULL_ONLY = 3
 };
-std::unordered_map<uint64_t, KVPairs<float> > mem_map;
+std::unordered_map<uint64_t, KVPairs<char> > mem_map;
+
+void aligned_memory_alloc(void** ptr, size_t size) {
+  size_t page_size = sysconf(_SC_PAGESIZE);
+  void* p;
+  int size_aligned = ROUNDUP(size, page_size);
+  int ret = posix_memalign(&p, page_size, size_aligned);
+  CHECK_EQ(ret, 0) << "posix_memalign error: " << strerror(ret);
+  CHECK(p);
+  memset(p, 0, size);
+  *ptr = p;
+}
 
 template <typename Val>
 void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer<Val> *server) {
@@ -25,12 +40,15 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
       PS_VLOG(1) << "receive key-" << key << " from worker-" << req_meta.sender;
       size_t len = (size_t) req_data.vals.size();
       mem_map[key].keys.push_back(key);
-      mem_map[key].vals.CopyFrom(req_data.vals);
       mem_map[key].lens.push_back(len);
+
+      void* ptr;
+      aligned_memory_alloc(&ptr, len);  
+      mem_map[key].vals.reset((char*)ptr, len, [](void *){ });
     }
 
     // send push response (empty)
-    KVPairs<float> res;
+    KVPairs<char> res;
     server->Response(req_meta, res);
   }
   else {
@@ -42,8 +60,8 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
 
 void StartServer() {
   if (!IsServer()) return;
-  auto server = new KVServer<float>(0);
-  server->set_request_handle(EmptyHandler<float>);
+  auto server = new KVServer<char>(0);
+  server->set_request_handle(EmptyHandler<char>);
   RegisterExitCallback([server]() { delete server; });
 }
 
@@ -53,7 +71,7 @@ struct PSKV {
 };
 std::unordered_map<uint64_t, PSKV> ps_kv_;
 
-void push_pull(KVWorker<float> &kv, std::vector<SArray<float> > &server_vals, 
+void push_pull(KVWorker<char> &kv, std::vector<SArray<char> > &server_vals, 
       int len, int num_servers, int total_key_num, int how_many_key_per_server, MODE mode) {
   CHECK_GT(mode, 0);
   switch (mode) {
@@ -110,7 +128,7 @@ void push_pull(KVWorker<float> &kv, std::vector<SArray<float> > &server_vals,
 
     end = std::chrono::high_resolution_clock::now();
     LL << "Application goodput: " 
-        << 8.0 * len * sizeof(float) * total_key_num * cnt / (end - start).count() 
+        << 8.0 * len * sizeof(char) * total_key_num * cnt / (end - start).count() 
         << " Gbps";
     cnt = 0;
     start = std::chrono::high_resolution_clock::now();
@@ -120,7 +138,7 @@ void push_pull(KVWorker<float> &kv, std::vector<SArray<float> > &server_vals,
 void RunWorker(int argc, char *argv[]) {
   if (!IsWorker()) return;
   CHECK_GE(argc, 3) << "input argument should be at least 3: SCRIPT, LEN, REPEAT, (OPTIONAL) MODE";
-  KVWorker<float> kv(0, 0);
+  KVWorker<char> kv(0, 0);
   auto krs = ps::Postoffice::Get()->GetServerKeyRanges();
 
   const int num_servers = krs.size();
@@ -136,10 +154,13 @@ void RunWorker(int argc, char *argv[]) {
   const int how_many_key_per_server = v ? atoi(v) : 10;
   const int total_key_num = num_servers * how_many_key_per_server;
 
-  std::vector<SArray<float> > server_vals;
+  std::vector<SArray<char> > server_vals;
   for (int key = 0; key < total_key_num; key++) {
-    std::vector<float> vec(len);
-    SArray<float> vals(vec);
+    std::vector<char> vec(len);
+    void* ptr;
+    aligned_memory_alloc(&ptr, len);
+    SArray<char> vals;
+    vals.reset((char*) ptr, len * sizeof(char), [](void *){});
     server_vals.push_back(vals);
   }
 
@@ -180,7 +201,7 @@ void RunWorker(int argc, char *argv[]) {
         auto end = std::chrono::high_resolution_clock::now();
         accumulated_ms += (end - start).count(); // ns
       }
-      LL << "push " << len * sizeof(float)
+      LL << "push " << len * sizeof(char)
           << " bytes to each server, repeat=" << repeat
           << ", total_time="
           << accumulated_ms / 1e6 << "ms";
@@ -202,7 +223,7 @@ void RunWorker(int argc, char *argv[]) {
         accumulated_ms += (end - start).count(); // ns
       }
 
-      LL << "pull " << len * sizeof(float)
+      LL << "pull " << len * sizeof(char)
           << " bytes to each server, repeat=" << repeat
           << ", total_time="
           << accumulated_ms / 1e6 << "ms";

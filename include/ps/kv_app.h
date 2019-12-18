@@ -582,7 +582,7 @@ void KVWorker<Val>::DefaultSlicer(
     k = send.vals.size() / send.keys.size();
     CHECK_EQ(k * send.keys.size(), send.vals.size());
   } else {
-    CHECK_EQ(send.keys.size(), send.lens.size());
+    CHECK_EQ(send.keys.size(), send.lens.size()) << send.keys.size() << ", " << send.lens.size();
   }
 
   // slice

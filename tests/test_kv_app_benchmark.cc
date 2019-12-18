@@ -39,12 +39,20 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
     if (mem_map.find(key) == mem_map.end()) {
       PS_VLOG(1) << "receive key-" << key << " from worker-" << req_meta.sender;
       size_t len = (size_t) req_data.vals.size();
-      mem_map[key].keys.push_back(key);
-      mem_map[key].lens.push_back(len);
 
-      void* ptr;
-      aligned_memory_alloc(&ptr, len);  
-      mem_map[key].vals.reset((char*)ptr, len, [](void *){ });
+      void* ptr_val;
+      aligned_memory_alloc(&ptr_val, len);  
+      mem_map[key].vals.reset((char*)ptr_val, len, [](void *){ });
+
+      void* ptr_key;
+      aligned_memory_alloc(&ptr_key, sizeof(Key));  
+      mem_map[key].keys.reset((Key*)ptr_key, 1, [](void *){ });
+      memcpy(ptr_key, &key, sizeof(Key));
+
+      void* ptr_len;
+      aligned_memory_alloc(&ptr_len, sizeof(int));  
+      mem_map[key].lens.reset((int*)ptr_len, 1, [](void *){ });
+      memcpy(ptr_len, &len, sizeof(int));
     }
 
     // send push response (empty)
@@ -65,14 +73,12 @@ void StartServer() {
   RegisterExitCallback([server]() { delete server; });
 }
 
-struct PSKV {
-  SArray<ps::Key> keys;  // n keys
-  SArray<int> lens;      // the length of the i-th value
-};
-std::unordered_map<uint64_t, PSKV> ps_kv_;
-
-void push_pull(KVWorker<char> &kv, std::vector<SArray<char> > &server_vals, 
-      int len, int num_servers, int total_key_num, int how_many_key_per_server, MODE mode) {
+void push_pull(KVWorker<char> &kv, 
+               std::vector<SArray<Key> > &server_keys,
+               std::vector<SArray<char> > &server_vals, 
+               std::vector<SArray<int> > &server_lens,
+               int len, int num_servers, int total_key_num, 
+               int how_many_key_per_server, MODE mode) {
   CHECK_GT(mode, 0);
   switch (mode) {
     case PUSH_PULL: 
@@ -100,9 +106,8 @@ void push_pull(KVWorker<char> &kv, std::vector<SArray<char> > &server_vals,
   int cnt = 0;
   while (1) {
     for (int key = 0; key < total_key_num; key++) {
-      PSKV& pskv = ps_kv_[key];
-      auto keys = pskv.keys;
-      auto lens = pskv.lens;
+      auto keys = server_keys[key];
+      auto lens = server_lens[key];
       auto vals = server_vals[key];
 
       switch (mode) {
@@ -158,6 +163,8 @@ void RunWorker(int argc, char *argv[]) {
   const int total_key_num = num_servers * how_many_key_per_server;
 
   std::vector<SArray<char> > server_vals;
+  std::vector<SArray<Key> > server_keys;
+  std::vector<SArray<int> > server_lens;
   for (int key = 0; key < total_key_num; key++) {
     void* ptr;
     aligned_memory_alloc(&ptr, len);
@@ -168,18 +175,27 @@ void RunWorker(int argc, char *argv[]) {
 
   // init push, do not count this into time cost
   for (int key = 0; key < total_key_num; key++) {
-    auto vals = server_vals[key];
-    PSKV& pskv = ps_kv_[key];
-    SArray<Key> keys;
-
     int server = key % num_servers;
     PS_VLOG(1) << "key=" << key << " assigned to server " << server;
+
+    auto vals = server_vals[key];
+
+    // page aligned keys
+    void* ptr_key;
+    aligned_memory_alloc(&ptr_key, sizeof(Key));
+    SArray<Key> keys;
+    keys.reset((Key*) ptr_key, 1, [](void *){});
     ps::Key ps_key = krs[server].begin() + key;
-    keys.push_back(ps_key);
+    memcpy(ptr_key, &ps_key, sizeof(Key));
+    server_keys.push_back(keys);
+
+    // page aligned vals
+    void* ptr_len;
+    aligned_memory_alloc(&ptr_len, sizeof(int));
     SArray<int> lens;
-    lens.push_back(len);
-    pskv.keys.push_back(ps_key);
-    pskv.lens.push_back(len);
+    lens.reset((int*) ptr_len, 1, [](void *){});
+    memcpy(ptr_len, &len, sizeof(len));
+    server_lens.push_back(lens);
 
     kv.Wait(kv.ZPush(keys, vals, lens));
   }
@@ -193,9 +209,8 @@ void RunWorker(int argc, char *argv[]) {
         auto start = std::chrono::high_resolution_clock::now();
         for (int server = 0; server < num_servers; server++) {
           int key = server;
-          PSKV& pskv = ps_kv_[key];
-          auto keys = pskv.keys;
-          auto lens = pskv.lens;
+          auto keys = server_keys[server];
+          auto lens = server_lens[server];
           auto vals = server_vals[server];
 
           kv.Wait(kv.ZPush(keys, vals, lens));
@@ -214,9 +229,8 @@ void RunWorker(int argc, char *argv[]) {
         auto start = std::chrono::high_resolution_clock::now();
         for (int server = 0; server < num_servers; server++) {
           int key = server;
-          PSKV& pskv = ps_kv_[key];
-          auto keys = pskv.keys;
-          auto lens = pskv.lens;
+          auto keys = server_keys[server];
+          auto lens = server_lens[server];
           auto vals = server_vals[server];
 
           kv.Wait(kv.ZPull(keys, &vals, &lens));
@@ -233,7 +247,7 @@ void RunWorker(int argc, char *argv[]) {
     case PUSH_PULL: 
     case PUSH_ONLY: 
     case PULL_ONLY: 
-      push_pull(kv, server_vals, len, num_servers, total_key_num, how_many_key_per_server, mode);
+      push_pull(kv, server_keys, server_vals, server_lens, len, num_servers, total_key_num, how_many_key_per_server, mode);
       break;
     default:
       CHECK(0) << "unknown mode " << mode;

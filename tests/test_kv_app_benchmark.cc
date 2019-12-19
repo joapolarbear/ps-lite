@@ -154,12 +154,12 @@ void RunWorker(int argc, char *argv[]) {
   CHECK_GT(num_servers, 0);
 
   // init
-  int len = atoi(argv[1]);
-  int repeat = atoi(argv[2]);
+  int len = (argc > 1) ? atoi(argv[1]) : 1024000;
+  int repeat = (argc > 2) ? atoi(argv[2]) : 10;
   MODE mode = (argc > 3) ? static_cast<MODE>(atoi(argv[3])) : PUSH_PULL;
 
   auto v = Environment::Get()->find("NUM_KEY_PER_SERVER");
-  const int how_many_key_per_server = v ? atoi(v) : 10;
+  const int how_many_key_per_server = v ? atoi(v) : 40;
   const int total_key_num = num_servers * how_many_key_per_server;
 
   std::vector<SArray<char> > server_vals;

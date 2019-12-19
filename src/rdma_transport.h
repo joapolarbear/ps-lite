@@ -167,20 +167,11 @@ struct Endpoint {
   }
 };
 
-struct AsyncCopy {
-  Endpoint* endpoint;
-  MessageBuffer* msg_buf;
-  void* dst;
-  void* src;
-  int len;
-  uint64_t meta_len;
-  bool shutdown;
-};
-
-
 class Transport {
  public:
    virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
+   virtual void PostRDMAWriteWithImm(MessageBuffer *msg_buf, struct ibv_sge *sge, size_t num_sge, 
+                                        uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
    virtual int Recv(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
    virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
    virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
@@ -199,6 +190,8 @@ class Transport {
    virtual void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) = 0;
 
+   virtual SArray<char> CreateFunctionalSarray(size_t size, void *value) = 0;
+
 }; // class Transport
 
 
@@ -208,7 +201,6 @@ class RDMATransport : public Transport {
     endpoint_ = CHECK_NOTNULL(endpoint);
     mempool_ = CHECK_NOTNULL(mempool);
     pagesize_ = sysconf(_SC_PAGESIZE);
-    PS_VLOG(1) << "System page size is " << pagesize_;
 
     auto val = Environment::Get()->find("DMLC_ROLE");
     std::string role(val);
@@ -245,7 +237,7 @@ class RDMATransport : public Transport {
     }
   }
 
-  void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
+  virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
     // prepare RDMA write sge list
     struct ibv_sge sge[1 + msg_buf->mrs.size()];
     sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
@@ -254,7 +246,6 @@ class RDMATransport : public Transport {
 
     size_t num_sge = 1;
     
-    uint64_t data_len = 0;
     if (msg_buf->mrs.size() == 3) { 
       // push request, split the meta and data into two writes
       // further, it does not send keys and lens since these meta already carries these info 
@@ -288,11 +279,14 @@ class RDMATransport : public Transport {
         sge[num_sge].length = length;
         sge[num_sge].lkey = pair.first->lkey;
         ++num_sge;
-        
-        data_len += length;
       }
     }
+    PostRDMAWriteWithImm(msg_buf, sge, num_sge, remote_addr, rkey, idx);
+  }
 
+  void PostRDMAWriteWithImm(MessageBuffer *msg_buf, struct ibv_sge *sge, 
+                                size_t num_sge, uint64_t remote_addr, 
+                                uint32_t rkey, uint32_t idx) {
     WRContext *write_ctx = msg_buf->reserved_context;
     CHECK(write_ctx);
     MessageBuffer **tmp =
@@ -421,7 +415,6 @@ class RDMATransport : public Transport {
     msg_buf->reserved_context = reserved;
     auto key = msg.meta.key;
     auto recver = msg.meta.recver;
-
     auto raddr = std::get<0>(remote_addr[recver]);
     auto rkey = std::get<1>(remote_addr[recver]);
     auto idx = std::get<2>(remote_addr[recver]);
@@ -489,18 +482,12 @@ class RDMATransport : public Transport {
     auto key = msg->meta.key;
     auto addr = msg->meta.addr;
 
-    SArray<char> keys;
-    void *p = malloc(sizeof(Key));
-    memcpy(p, &msg->meta.key, sizeof(Key));
-    keys.reset((char *) p, sizeof(Key), [p](void *) { free(p); });
+    SArray<char> keys = CreateFunctionalSarray(sizeof(Key), &msg->meta.key);
 
     SArray<char> vals;
     vals.reset(reinterpret_cast<char*>(addr), msg->meta.val_len, [](void *){});
 
-    SArray<char> lens;
-    void *q = malloc(sizeof(int));
-    memcpy(q, &msg->meta.val_len, sizeof(int));
-    lens.reset((char *) q, sizeof(int), [q](void *) { free(q); });
+    SArray<char> lens = CreateFunctionalSarray(sizeof(int), &msg->meta.val_len);
 
     msg->data.push_back(keys);
     msg->data.push_back(vals);
@@ -510,6 +497,14 @@ class RDMATransport : public Transport {
 
   virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
     return Recv(msg, buffer_ctx, meta_len);
+  }
+
+  SArray<char> CreateFunctionalSarray(size_t size, void *value) {
+    SArray<char> sarr;
+    void *p = malloc(size);
+    memcpy(p, value, size);
+    sarr.reset((char *) p, size, [p](void *) { free(p); });
+    return sarr;
   }
 
  private:
@@ -527,18 +522,12 @@ class RDMATransport : public Transport {
 
       cur = buffer_ctx->buffer + align_ceil((size_t) meta_len, pagesize_);
       
-      SArray<char> keys;
-      void *p = malloc(sizeof(Key));
-      memcpy(p, &msg->meta.key, sizeof(Key));
-      keys.reset((char *) p, sizeof(Key), [p](void *) { free(p); });
+      SArray<char> keys = CreateFunctionalSarray(sizeof(Key), &msg->meta.key);
 
       SArray<char> vals;
       vals.reset(cur, len, [](void *) {});  // no need to delete
 
-      SArray<char> lens;
-      void *q = malloc(sizeof(int));
-      memcpy(q, &len, sizeof(int));
-      lens.reset((char *) q, sizeof(int), [q](void *) { free(q); });
+      SArray<char> lens = CreateFunctionalSarray(sizeof(int), &msg->meta.val_len);
 
       msg->data.push_back(keys);
       msg->data.push_back(vals);
@@ -568,8 +557,6 @@ class RDMATransport : public Transport {
   std::unordered_map<char*, struct ibv_mr*> mem_mr_map_; // (memory, ibv_mr) 
 
 }; // class Transport
-
-
 
 class IPCTransport : public RDMATransport {
  public:
@@ -605,25 +592,73 @@ class IPCTransport : public RDMATransport {
     }
   }
 
-  void SendPushRequest(Message &msg, MessageBuffer *msg_buf) {
-    // get from shared memory
+  void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
+    // prepare RDMA write sge list
+    struct ibv_sge sge[1 + msg_buf->mrs.size()];
+    sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
+    sge[0].length = msg_buf->inline_len;
+    sge[0].lkey = mempool_->LocalKey(msg_buf->inline_buf);
+
+    size_t num_sge = 1;
+    if (msg_buf->mrs.size() != 3) { 
+      // not push request
+      for (auto &pair : msg_buf->mrs) {
+        size_t length = pair.second;      
+        CHECK(length);
+        sge[num_sge].addr =
+            reinterpret_cast<uint64_t>(pair.first->addr);
+        sge[num_sge].length = length;
+        sge[num_sge].lkey = pair.first->lkey;
+        ++num_sge;
+      }
+    }
+    PostRDMAWriteWithImm(msg_buf, sge, num_sge, remote_addr, rkey, idx);
   }
 
-  void SendPullResponse(Message &msg, MessageBuffer *msg_buf) {
-    // std::lock_guard<std::mutex> lock(map_mu_);
-    // auto key = msg.meta.key;
-    // auto recver = msg.meta.recver;
-    // auto len = std::get<0>(key_meta_map_[key][recver]);
-
-    // // IPC
-    // auto addr = (void*) msg_buf->data[1].data();
-    // CHECK(addr);
-    // void* shm_addr = GetSharedMemory(kShmPrefix, key);
-    // // async copy
-    // AsyncCopy m = {endpoint, msg_buf, shm_addr, addr, len, meta_len, false};
-    // auto cnt = cpy_counter_.fetch_add(1);
-    // async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
+  void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
+    auto key = msg.meta.key;
+    auto recver = msg.meta.recver;
+    auto len = msg.meta.val_len;
+    auto addr = (void*) msg_buf->data[1].data();
+    CHECK(addr);
+    void* shm_addr = GetSharedMemory(kShmPrefix, key);
+    // async copy with a simple load-balancing strategy
+    AsyncCopy m = {msg_buf, shm_addr, addr, len, remote_addr, recver, false};
+    auto cnt = cpy_counter_.fetch_add(1);
+    async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
   }
+
+  int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
+    CHECK(msg->meta.push && msg->meta.request);
+    // get data message from local shared memory
+    auto key = msg->meta.key;
+    auto len = msg->meta.val_len;
+  
+    SArray<char> keys = CreateFunctionalSarray(sizeof(Key), &msg->meta.key);
+
+    SArray<char> vals;
+    void* addr = GetSharedMemory(kShmPrefix, key);
+    vals.reset(reinterpret_cast<char*>(addr), len, [](void *){});
+
+    SArray<char> lens = CreateFunctionalSarray(sizeof(int), &msg->meta.val_len);
+
+    msg->data.push_back(keys);
+    msg->data.push_back(vals);
+    msg->data.push_back(lens);
+
+    return keys.size() + vals.size() + lens.size();
+  }
+
+ private:
+  struct AsyncCopy {
+    MessageBuffer* msg_buf;
+    void* dst;
+    void* src;
+    int len;
+    RemoteAddress remote_addr;
+    int recver;
+    bool shutdown;
+  };
 
   void AsyncCopyThread(int i) {
     auto& q = async_copy_queue_[i];
@@ -638,40 +673,17 @@ class IPCTransport : public RDMATransport {
       CHECK(m.src);
       memcpy(m.dst, m.src, m.len);
 
-      WRContext *context = nullptr, *reserved = nullptr;
-      m.endpoint->free_write_ctx.WaitAndPop(&reserved);
-      m.endpoint->free_start_ctx.WaitAndPop(&context);
-
-      m.msg_buf->reserved_context = reserved;
-      RendezvousStart *req =
-          reinterpret_cast<RendezvousStart *>(context->buffer->addr);
-      req->meta_len = m.meta_len;
-      req->origin_addr = reinterpret_cast<uint64_t>(m.msg_buf);
-
-      auto addr = reinterpret_cast<uint64_t>(req);
-      req->data_num = 0;
-
-      struct ibv_sge sge;
-      sge.addr = reinterpret_cast<uint64_t>(req);
-      sge.lkey = context->buffer->lkey;
-      sge.length = sizeof(RendezvousStart);
-
-      struct ibv_send_wr wr, *bad_wr = nullptr;
-      memset(&wr, 0, sizeof(wr));
-      wr.wr_id = reinterpret_cast<uint64_t>(context);
-      wr.opcode = IBV_WR_SEND_WITH_IMM;
-      wr.next = nullptr;
-      wr.imm_data = kRendezvousStart;
-      wr.send_flags = IBV_SEND_SIGNALED;
-      wr.sg_list = &sge;
-      wr.num_sge = 1;
-
-      CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
-          << strerror(errno);
+      struct ibv_sge sge[1];
+      sge[0].addr = reinterpret_cast<uint64_t>(m.msg_buf->inline_buf);
+      sge[0].length = m.msg_buf->inline_len;
+      sge[0].lkey = mempool_->LocalKey(m.msg_buf->inline_buf);
+      
+      auto raddr = std::get<0>(m.remote_addr[m.recver]);
+      auto rkey  = std::get<1>(m.remote_addr[m.recver]);
+      auto idx   = std::get<2>(m.remote_addr[m.recver]);
+      PostRDMAWriteWithImm(m.msg_buf, sge, 1, raddr, rkey, idx);
     }
   }
-
- private:
 
   void* GetSharedMemory(const std::string& prefix, uint64_t key) {
     std::lock_guard<std::mutex> lock(shm_mu_);

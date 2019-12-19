@@ -190,7 +190,7 @@ class Transport {
    virtual void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) = 0;
 
-   virtual SArray<char> CreateFunctionalSarray(size_t size, void *value) = 0;
+   virtual SArray<char> CreateFunctionalSarray(void *value, size_t size) = 0;
 
 }; // class Transport
 
@@ -355,7 +355,8 @@ class RDMATransport : public Transport {
     }
     
     // worker only needs a buffer for receving meta
-    char *buffer = mempool_->Alloc(is_server_ ? (kMaxMetaBound + len) : (kMaxMetaBound + req->meta_len));
+    char *buffer = 
+        mempool_->Alloc(is_server_ ? (kMaxMetaBound + len) : (kMaxMetaBound + req->meta_len));
     CHECK(buffer);
     buf_ctx->buffer = buffer;
     WRContext *reply_ctx = nullptr;
@@ -482,12 +483,12 @@ class RDMATransport : public Transport {
     auto key = msg->meta.key;
     auto addr = msg->meta.addr;
 
-    SArray<char> keys = CreateFunctionalSarray(sizeof(Key), &msg->meta.key);
+    SArray<char> keys = CreateFunctionalSarray(&msg->meta.key, sizeof(Key));
 
     SArray<char> vals;
     vals.reset(reinterpret_cast<char*>(addr), msg->meta.val_len, [](void *){});
 
-    SArray<char> lens = CreateFunctionalSarray(sizeof(int), &msg->meta.val_len);
+    SArray<char> lens = CreateFunctionalSarray(&msg->meta.val_len, sizeof(int));
 
     msg->data.push_back(keys);
     msg->data.push_back(vals);
@@ -499,7 +500,7 @@ class RDMATransport : public Transport {
     return Recv(msg, buffer_ctx, meta_len);
   }
 
-  SArray<char> CreateFunctionalSarray(size_t size, void *value) {
+  SArray<char> CreateFunctionalSarray(void *value, size_t size) {
     SArray<char> sarr;
     void *p = malloc(size);
     memcpy(p, value, size);
@@ -522,12 +523,12 @@ class RDMATransport : public Transport {
 
       cur = buffer_ctx->buffer + align_ceil((size_t) meta_len, pagesize_);
       
-      SArray<char> keys = CreateFunctionalSarray(sizeof(Key), &msg->meta.key);
+      SArray<char> keys = CreateFunctionalSarray(&msg->meta.key, sizeof(Key));
 
       SArray<char> vals;
       vals.reset(cur, len, [](void *) {});  // no need to delete
 
-      SArray<char> lens = CreateFunctionalSarray(sizeof(int), &msg->meta.val_len);
+      SArray<char> lens = CreateFunctionalSarray(&msg->meta.val_len, sizeof(int));
 
       msg->data.push_back(keys);
       msg->data.push_back(vals);
@@ -564,7 +565,6 @@ class IPCTransport : public RDMATransport {
   explicit IPCTransport(Endpoint *endpoint, SimpleMempool *mempool) : RDMATransport(endpoint, mempool) {
     auto val = Environment::Get()->find("BYTEPS_IPC_COPY_NUM_THREADS");
     ipc_copy_nthreads_ = val ? atoi(val) : 4;
-    LOG(INFO) << "IPC async copy nthreads set to " << ipc_copy_nthreads_;
     for (int i = 0; i < ipc_copy_nthreads_; ++i) {
       auto q = new ThreadsafeQueue<AsyncCopy>;
       async_copy_queue_.push_back(q);
@@ -580,7 +580,6 @@ class IPCTransport : public RDMATransport {
     auto byteps_local_size = val ? atoi(val) : 1;
     byteps_partition_bytes_ = AlignTo(byteps_partition_bytes_, (8 * byteps_local_size));
     CHECK(val) << "BYTEPS_LOCAL_SIZE not set";
-    LOG(INFO) << "partition bytes set to " << byteps_partition_bytes_ << ", should be identical with byteps core";
   };
 
   ~IPCTransport() {
@@ -634,13 +633,13 @@ class IPCTransport : public RDMATransport {
     auto key = msg->meta.key;
     auto len = msg->meta.val_len;
   
-    SArray<char> keys = CreateFunctionalSarray(sizeof(Key), &msg->meta.key);
+    SArray<char> keys = CreateFunctionalSarray(&msg->meta.key, sizeof(Key));
 
     SArray<char> vals;
     void* addr = GetSharedMemory(kShmPrefix, key);
     vals.reset(reinterpret_cast<char*>(addr), len, [](void *){});
 
-    SArray<char> lens = CreateFunctionalSarray(sizeof(int), &msg->meta.val_len);
+    SArray<char> lens = CreateFunctionalSarray(&msg->meta.val_len, sizeof(int));
 
     msg->data.push_back(keys);
     msg->data.push_back(vals);

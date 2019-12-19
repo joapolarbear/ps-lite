@@ -238,6 +238,9 @@ class RDMATransport : public Transport {
   }
 
   virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
+    WRContext *reserved = nullptr;
+    endpoint_->free_write_ctx.WaitAndPop(&reserved);
+    msg_buf->reserved_context = reserved;
     // prepare RDMA write sge list
     struct ibv_sge sge[1 + msg_buf->mrs.size()];
     sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
@@ -411,15 +414,10 @@ class RDMATransport : public Transport {
   }
 
   void Send(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
-    WRContext *reserved = nullptr;
-    endpoint_->free_write_ctx.WaitAndPop(&reserved);
-    msg_buf->reserved_context = reserved;
-    auto key = msg.meta.key;
     auto recver = msg.meta.recver;
     auto raddr = std::get<0>(remote_addr[recver]);
     auto rkey = std::get<1>(remote_addr[recver]);
     auto idx = std::get<2>(remote_addr[recver]);
-
     RDMAWriteWithImm(msg_buf, raddr, rkey, idx);
   }
 
@@ -592,6 +590,9 @@ class IPCTransport : public RDMATransport {
   }
 
   void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
+    WRContext *reserved = nullptr;
+    endpoint_->free_write_ctx.WaitAndPop(&reserved);
+    msg_buf->reserved_context = reserved;
     // prepare RDMA write sge list
     struct ibv_sge sge[1 + msg_buf->mrs.size()];
     sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
@@ -680,6 +681,10 @@ class IPCTransport : public RDMATransport {
       auto raddr = std::get<0>(m.remote_addr[m.recver]);
       auto rkey  = std::get<1>(m.remote_addr[m.recver]);
       auto idx   = std::get<2>(m.remote_addr[m.recver]);
+
+      WRContext *reserved = nullptr;
+      endpoint_->free_write_ctx.WaitAndPop(&reserved);
+      m.msg_buf->reserved_context = reserved;
       PostRDMAWriteWithImm(m.msg_buf, sge, 1, raddr, rkey, idx);
     }
   }

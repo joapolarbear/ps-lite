@@ -207,10 +207,12 @@ class RDMATransport : public Transport {
   explicit RDMATransport(Endpoint *endpoint, SimpleMempool *mempool) {
     endpoint_ = CHECK_NOTNULL(endpoint);
     mempool_ = CHECK_NOTNULL(mempool);
+    pagesize_ = sysconf(_SC_PAGESIZE);
+    PS_VLOG(1) << "System page size is " << pagesize_;
+
     auto val = Environment::Get()->find("DMLC_ROLE");
     std::string role(val);
     is_server_ = (role=="server");
-    pagesize_ = sysconf(_SC_PAGESIZE);
   };
 
   ~RDMATransport() {
@@ -255,6 +257,7 @@ class RDMATransport : public Transport {
     uint64_t data_len = 0;
     if (msg_buf->mrs.size() == 3) { 
       // push request, split the meta and data into two writes
+      // further, it does not send keys and lens since these meta already carries these info 
       struct ibv_sge my_sge;
       my_sge.addr = reinterpret_cast<uint64_t>(msg_buf->mrs[1].first->addr);
       my_sge.length = msg_buf->mrs[1].second;
@@ -268,8 +271,10 @@ class RDMATransport : public Transport {
       wr.next = nullptr;
       wr.sg_list = &my_sge;
       wr.num_sge = 1;
-      wr.wr.rdma.remote_addr = remote_addr + align_ceil(msg_buf->inline_len, pagesize_);
       wr.wr.rdma.rkey = rkey;
+
+      // write to the next page-aligned address (remote_addr should already be aligned)
+      wr.wr.rdma.remote_addr = remote_addr + align_ceil(msg_buf->inline_len, pagesize_);
 
       CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
         << "ibv_post_send failed.";
@@ -479,35 +484,27 @@ class RDMATransport : public Transport {
   }
 
   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    int total_data_len = 0;
     std::lock_guard<std::mutex> lock(map_mu_);
     auto key = msg->meta.key;
-    if (key_len_map_.find(key) == key_len_map_.end()) {
-      // need a static address for keys/lens
-      key_addr_map_[key] = (ps::Key) key;
-      key_len_map_[key] = (int) msg->meta.val_len;
-    }
-    CHECK_NE(key_len_map_.find(key), key_len_map_.end()) << key;
-    CHECK_NE(key_addr_map_.find(key), key_addr_map_.end()) << key;
-
     auto addr = msg->meta.addr;
 
-    CHECK_NE(key_len_map_[key], 0) << msg->DebugString();
-
     SArray<char> keys;
-    SArray<char> vals;
-    SArray<char> lens;
+    void *p = malloc(sizeof(Key));
+    memcpy(p, &msg->meta.key, sizeof(Key));
+    keys.reset((char *) p, sizeof(Key), [p](void *) { free(p); });
 
-    keys.reset(reinterpret_cast<char*>(&key_addr_map_[key]), sizeof(ps::Key), [](void *){});
-    vals.reset(reinterpret_cast<char*>(addr), key_len_map_[key], [](void *){});
-    lens.reset(reinterpret_cast<char*>(&key_len_map_[key]), sizeof(int), [](void *){});
+    SArray<char> vals;
+    vals.reset(reinterpret_cast<char*>(addr), msg->meta.val_len, [](void *){});
+
+    SArray<char> lens;
+    void *q = malloc(sizeof(int));
+    memcpy(q, &msg->meta.val_len, sizeof(int));
+    lens.reset((char *) q, sizeof(int), [q](void *) { free(q); });
 
     msg->data.push_back(keys);
     msg->data.push_back(vals);
     msg->data.push_back(lens);
-    total_data_len += keys.size() + vals.size() + lens.size();
-
-    return total_data_len;
+    return keys.size() + vals.size() + lens.size();
   }
 
   virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
@@ -527,7 +524,7 @@ class RDMATransport : public Transport {
       CHECK_EQ(data_num, 3);
       uint32_t len = buffer_ctx->data_len[1];
 
-      cur = buffer_ctx->buffer + align_ceil((size_t)meta_len, pagesize_);
+      cur = buffer_ctx->buffer + align_ceil((size_t) meta_len, pagesize_);
       
       SArray<char> keys;
       void *p = malloc(sizeof(Key));
@@ -565,18 +562,9 @@ class RDMATransport : public Transport {
   size_t pagesize_ = 4096;
   Endpoint *endpoint_;
   SimpleMempool *mempool_;
-  // role is server or worker
   bool is_server_;
-
-  // manage the following map
   std::mutex map_mu_;
-
-  // (memory, ibv_mr) 
-  std::unordered_map<char*, struct ibv_mr*> mem_mr_map_;
-
-  // store the static address for keys and lens
-  std::unordered_map<ps::Key, ps::Key> key_addr_map_;
-  std::unordered_map<ps::Key, int> key_len_map_;
+  std::unordered_map<char*, struct ibv_mr*> mem_mr_map_; // (memory, ibv_mr) 
 
 }; // class Transport
 

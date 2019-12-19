@@ -206,7 +206,6 @@ void RunWorker(int argc, char *argv[]) {
       for (int i = 0; i < repeat; ++i) {
         auto start = std::chrono::high_resolution_clock::now();
         for (int server = 0; server < num_servers; server++) {
-          int key = server;
           auto keys = server_keys[server];
           auto lens = server_lens[server];
           auto vals = server_vals[server];
@@ -226,7 +225,6 @@ void RunWorker(int argc, char *argv[]) {
       for (int i = 0; i < repeat; ++i) {
         auto start = std::chrono::high_resolution_clock::now();
         for (int server = 0; server < num_servers; server++) {
-          int key = server;
           auto keys = server_keys[server];
           auto lens = server_lens[server];
           auto vals = server_vals[server];

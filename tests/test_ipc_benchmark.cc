@@ -119,7 +119,6 @@ void push_pull(KVWorker<char> &kv,
   int cnt = 0;
   while (1) {
     for (int i = 0; i < total_key_num; i++) {
-      auto key = EncodeKey(i);
       auto keys = server_keys[i];
       auto lens = server_lens[i];
       auto vals = server_vals[i];
@@ -158,7 +157,7 @@ void RunWorker(int argc, char *argv[]) {
 
   size_t partition_bytes = Environment::Get()->find("BYTEPS_PARTITION_BYTES") ? 
       atoi(Environment::Get()->find("BYTEPS_PARTITION_BYTES")) : 4096000;
-  CHECK_GE(partition_bytes, len) 
+  CHECK_GE(partition_bytes, (size_t)len) 
       << "tensor partition is not supported in this benchmark"
       << ", try reduce tensor size or increase BYTEPS_PARTITION_BYTES";
 
@@ -171,7 +170,6 @@ void RunWorker(int argc, char *argv[]) {
   std::vector<SArray<int> > server_lens;
   for (int i = 0; i < total_key_num; i++) {
     auto key = EncodeKey(i);
-    void* ptr;
     SArray<char> vals;
     auto addr = (char*) OpenSharedMemory(std::string("BytePS_ShM_"), key, len);
     vals.reset((char*) addr, len, [](void *){});

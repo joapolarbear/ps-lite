@@ -145,7 +145,6 @@ void push_pull(KVWorker<char> &kv,
 
 void RunWorker(int argc, char *argv[]) {
   if (!IsWorker()) return;
-  CHECK_GE(argc, 3) << "input argument should be at least 3: SCRIPT, LEN, REPEAT, (OPTIONAL) MODE";
   KVWorker<char> kv(0, 0);
   auto krs = ps::Postoffice::Get()->GetServerKeyRanges();
 

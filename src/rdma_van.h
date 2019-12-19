@@ -322,9 +322,6 @@ class RDMAVan : public Van {
       auto is_push = msg.meta.push;
       auto key = msg.meta.key;
       if (!HasRemoteInfo(msg_buf, key, is_push)) {
-        // LOG(INFO) << "Call SendRendezvousBegin" << ", key=" << key
-        //     << ", " << (is_push?"push":"pull") << " " << (msg.meta.request?"request":"response")
-        //     << ", push_addr.size=" << push_addr_.size();
         trans->SendRendezvousBegin(msg, msg_buf);
         return total_len;
       }
@@ -335,19 +332,15 @@ class RDMAVan : public Van {
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
       // worker, push request
-      // LOG(INFO) << "SEND PUSH REQUEST, key=" << key;
       trans->SendPushRequest(msg, msg_buf, remote_addr_tuple);
     } else if (msg.meta.push && !msg.meta.request) { 
       // server, push response
-      // LOG(INFO) << "SEND PUSH RESPONSE, key=" << key;
       trans->SendPushResponse(msg, msg_buf, remote_addr_tuple);
     } else if (!msg.meta.push && msg.meta.request) { 
       // worker, pull request
-      // LOG(INFO) << "SEND PULL REQUEST, key=" << key;
       trans->SendPullRequest(msg, msg_buf, remote_addr_tuple);
     } else if (!msg.meta.push && !msg.meta.request) { 
       // server, pull response
-      // LOG(INFO) << "SEND PULL RESPONSE, key=" << key;
       trans->SendPullResponse(msg, msg_buf, remote_addr_tuple);
     } else {
       CHECK(0) << "unexpected message type";
@@ -386,20 +379,16 @@ class RDMAVan : public Van {
     // valid data message
     if (msg->meta.push && msg->meta.request) { 
       // push request
-      // LOG(INFO) << "RECV PUSH REQUEST, key=" << msg->meta.key;
       total_len += trans->RecvPushRequest(msg, buffer_ctx, meta_len);
       StoreWorkerTensorAddress(msg);
     } else if (!msg->meta.push && msg->meta.request) { 
       // pull request
-      // LOG(INFO) << "RECV PULL REQUEST, key=" << msg->meta.key;
       total_len += trans->RecvPullRequest(msg, buffer_ctx, meta_len);
     } else if (msg->meta.push && !msg->meta.request) { 
       // push response
-      // LOG(INFO) << "RECV PUSH RESPONSE, key=" << msg->meta.key;
       total_len += trans->RecvPushResponse(msg, buffer_ctx, meta_len);
     } else if (!msg->meta.push && !msg->meta.request) { 
       // pull response
-      // LOG(INFO) << "RECV PULL RESPONSE, key=" << msg->meta.key;
       total_len += trans->RecvPullResponse(msg, buffer_ctx, meta_len);
     } else {
       CHECK(0) << "unknown msg type";
@@ -727,14 +716,6 @@ class RDMAVan : public Van {
   std::unique_ptr<std::thread> cm_event_polling_thread_;
   // Recv buffer queue
   ThreadsafeQueue<std::tuple<Endpoint *, BufferContext *>> recv_buffers_;
-
-  // RDMA logging info
-  bool enable_rdma_log_;
-
-  // a static address for the key
-  std::unordered_map<ps::Key, ps::Key> key_addr_map_;
-  // a static address for the length
-  std::unordered_map<ps::Key, int> key_len_map_;
 
   // local IPC related
   bool disable_ipc_ = false;

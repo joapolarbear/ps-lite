@@ -257,12 +257,18 @@ class RDMAVan : public Van {
     }
   }
 
-  bool HasRemoteInfo(MessageBuffer *msg_buf, uint64_t key, bool is_push) {
+  bool HasRemoteInfo(MessageBuffer *msg_buf, uint64_t key, bool is_push, int recver) {
     std::lock_guard<std::mutex> lk(addr_mu_);
-    if ( is_push && (push_addr_.find(key) != push_addr_.end())) return true;
-    if (!is_push && (pull_addr_.find(key) != pull_addr_.end())) return true;
+    if (is_push && (push_addr_.find(key) != push_addr_.end()) 
+        && (push_addr_[key].find(recver) != push_addr_[key].end())) {
+      return true;
+    }
+    if (!is_push && (pull_addr_.find(key) != pull_addr_.end()) 
+        && (pull_addr_[key].find(recver) != pull_addr_[key].end())) {
+      return true;
+    }
     // no remote info, store the msg_buf address and push/pull flag for RendezvousReply
-    msgbuf_cache_.emplace(reinterpret_cast<uint64_t>(msg_buf), std::make_pair(key, is_push));
+    msgbuf_cache_.emplace(reinterpret_cast<uint64_t>(msg_buf), std::make_tuple(key, is_push, recver));
     return false;
   }
 
@@ -272,10 +278,11 @@ class RDMAVan : public Van {
     std::lock_guard<std::mutex> lk(addr_mu_);
     auto key = std::get<0>(msgbuf_cache_[buf]);
     auto is_push = std::get<1>(msgbuf_cache_[buf]);
+    auto recver = std::get<2>(msgbuf_cache_[buf]);
     if (is_push) {
-      push_addr_[key] = std::make_tuple(remote_addr, rkey, idx);
+      push_addr_[key][recver] = std::make_tuple(remote_addr, rkey, idx);
     } else {
-      pull_addr_[key] = std::make_tuple(remote_addr, rkey, idx);
+      pull_addr_[key][recver] = std::make_tuple(remote_addr, rkey, idx);
     }
     CHECK_NE(msgbuf_cache_.find(buf), msgbuf_cache_.end());
     msgbuf_cache_.erase(buf);
@@ -321,7 +328,7 @@ class RDMAVan : public Van {
       trans->PrepareData(msg, msg_buf);
       auto is_push = msg.meta.push;
       auto key = msg.meta.key;
-      if (!HasRemoteInfo(msg_buf, key, is_push)) {
+      if (!HasRemoteInfo(msg_buf, key, is_push, remote_id)) {
         trans->SendRendezvousBegin(msg, msg_buf);
         return total_len;
       }
@@ -730,9 +737,9 @@ class RDMAVan : public Van {
 
   // store rendezvous address
   std::mutex addr_mu_;
-  std::unordered_map<uint64_t, RemoteAddress> push_addr_; // key, <remote_addr, rkey, idx>
-  std::unordered_map<uint64_t, RemoteAddress> pull_addr_; // key, <remote_addr, rkey, idx>
-  std::unordered_map<uint64_t, std::pair<uint64_t, bool> > msgbuf_cache_; // msg_buf, <key, is_push>
+  std::unordered_map<uint64_t, RemoteAddress> push_addr_; // <key, recver>, <remote_addr, rkey, idx>
+  std::unordered_map<uint64_t, RemoteAddress> pull_addr_; // <key, recver>, <remote_addr, rkey, idx>
+  std::unordered_map<uint64_t, std::tuple<uint64_t, bool, int> > msgbuf_cache_; // msg_buf, <key, is_push, recver>
 };  // class RDMAVan
 
 };  // namespace ps

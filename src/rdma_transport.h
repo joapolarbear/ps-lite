@@ -420,10 +420,11 @@ class RDMATransport : public Transport {
     endpoint_->free_write_ctx.WaitAndPop(&reserved);
     msg_buf->reserved_context = reserved;
     auto key = msg.meta.key;
+    auto recver = msg.meta.recver;
 
-    auto raddr = std::get<0>(remote_addr);
-    auto rkey = std::get<1>(remote_addr);
-    auto idx = std::get<2>(remote_addr);
+    auto raddr = std::get<0>(remote_addr[recver]);
+    auto rkey = std::get<1>(remote_addr[recver]);
+    auto idx = std::get<2>(remote_addr[recver]);
 
     RDMAWriteWithImm(msg_buf, raddr, rkey, idx);
   }

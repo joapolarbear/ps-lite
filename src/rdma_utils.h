@@ -72,7 +72,7 @@ static const int kMaxResolveRetry = 50000;
 static const int kBasePort = 9010;
 
 // allocate 4KB more for meta with potentially variable length
-static const int kMaxMetaBound = 4096000;
+static const int kMaxMetaBound = 4096;
 
 // should have the same prefix with BytePS shared memory
 static const std::string kShmPrefix("BytePS_ShM_");

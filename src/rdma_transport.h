@@ -570,10 +570,9 @@ class IPCTransport : public RDMATransport {
     val = Environment::Get()->find("BYTEPS_PARTITION_BYTES");
     byteps_partition_bytes_ = val ? atoi(val) : 4096000;
 
-    val = Environment::Get()->find("BYTEPS_LOCAL_SIZE");
+    val = CHECK_NOTNULL(Environment::Get()->find("BYTEPS_LOCAL_SIZE"));
     auto byteps_local_size = val ? atoi(val) : 1;
-    byteps_partition_bytes_ = AlignTo(byteps_partition_bytes_, (8 * byteps_local_size));
-    CHECK(val) << "BYTEPS_LOCAL_SIZE not set";
+    byteps_partition_bytes_ = RoundUp(byteps_partition_bytes_, byteps_local_size * sysconf(_SC_PAGESIZE));
   };
 
   ~IPCTransport() {

@@ -402,6 +402,8 @@ uint64_t DecodeWorkerKey(uint64_t key) {
 }
 
 int AlignTo(int input, int alignment) { return input / alignment * alignment; }
+int DivUp(int x, int y) { return (x + y - 1) / y; }
+int RoundUp(int x, int y) { return DivUp(x, y) * y; }
 
 };  // namespace ps
 

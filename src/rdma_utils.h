@@ -71,8 +71,8 @@ static const int kMaxDataFields = 4;
 static const int kMaxResolveRetry = 50000;
 static const int kBasePort = 9010;
 
-// allocate 2KB more for meta with potentially variable length
-static const int kMaxMetaBound = 2048;
+// allocate a whole page for meta with potentially variable length
+static const int kMaxMetaBound = sysconf(_SC_PAGESIZE);
 
 // should have the same prefix with BytePS shared memory
 static const std::string kShmPrefix("BytePS_ShM_");

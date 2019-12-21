@@ -227,12 +227,17 @@ class RDMATransport : public Transport {
   }
 
   void PrepareData(Message &msg, MessageBuffer *msg_buf) {
+    if (!msg.meta.push && !msg.meta.request) return; // pull response does not need data
+
     for (auto &sa : msg_buf->data) {
       if (sa.size() == 0) continue;
+
       std::lock_guard<std::mutex> lock(map_mu_);
       auto it = mem_mr_map_.find(sa.data());
       MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
+
       CHECK(ptr.get()) << strerror(errno);
+      
       msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
     }
   }
@@ -460,8 +465,6 @@ class RDMATransport : public Transport {
       << "ibv_post_send failed.";
 
     // after write keys/vals/lens (no imm), write the meta (with imm)
-    // TODO: consolidate this into one RDMA_WRITE_WITH_IMM
-    msg_buf->mrs.clear(); 
     Send(msg, msg_buf, remote_addr);
   }
 

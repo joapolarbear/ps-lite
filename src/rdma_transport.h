@@ -255,6 +255,7 @@ class RDMATransport : public Transport {
     size_t num_sge = 1;
     
     if (msg_buf->mrs.size() == 3) { 
+      LOG(INFO) << "#########";
       // push request, split the meta and data into two writes
       // further, it does not send keys and lens since these meta already carries these info 
       struct ibv_sge my_sge;
@@ -587,43 +588,27 @@ class IPCTransport : public RDMATransport {
     }
   }
 
-  void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
-    WRContext *reserved = nullptr;
-    endpoint_->free_write_ctx.WaitAndPop(&reserved);
-    msg_buf->reserved_context = reserved;
-    // prepare RDMA write sge list
-    struct ibv_sge sge[1 + msg_buf->mrs.size()];
-    sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
-    sge[0].length = msg_buf->inline_len;
-    sge[0].lkey = mempool_->LocalKey(msg_buf->inline_buf);
-
-    size_t num_sge = 1;
-    if (msg_buf->mrs.size() != 3) { 
-      // not push request
-      for (auto &pair : msg_buf->mrs) {
-        size_t length = pair.second;      
-        CHECK(length);
-        sge[num_sge].addr =
-            reinterpret_cast<uint64_t>(pair.first->addr);
-        sge[num_sge].length = length;
-        sge[num_sge].lkey = pair.first->lkey;
-        ++num_sge;
-      }
-    }
-    PostRDMAWriteWithImm(msg_buf, sge, num_sge, remote_addr, rkey, idx);
+  void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
+    msg_buf->mrs.clear();
+    CHECK_EQ(msg_buf->mrs.size(), 0);
+    Send(msg, msg_buf, remote_addr);
   }
 
   void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
-    auto key = msg.meta.key;
-    auto recver = msg.meta.recver;
-    auto len = msg.meta.val_len;
-    auto addr = (void*) msg_buf->data[1].data();
-    CHECK(addr);
-    void* shm_addr = GetSharedMemory(kShmPrefix, key);
-    // async copy with a simple load-balancing strategy
-    AsyncCopy m = {msg_buf, shm_addr, addr, len, remote_addr, recver, false};
-    auto cnt = cpy_counter_.fetch_add(1);
-    async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
+    CHECK_EQ(msg_buf->mrs.size(), 0);
+    std::lock_guard<std::mutex> lock(map_mu_);
+    auto addr = (void*) CHECK_NOTNULL(msg.data[1].data());
+    void* shm_addr = GetSharedMemory(kShmPrefix, msg.meta.key);
+    CHECK(shm_addr);
+
+    /* async copy with a simple load-balancing strategy */
+    // AsyncCopy m = {msg_buf, shm_addr, addr, len, remote_addr, recver, false};
+    // auto cnt = cpy_counter_.fetch_add(1);
+    // async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
+    
+    // synchronous copy
+    memcpy(shm_addr, addr, msg.meta.val_len);
+    Send(msg, msg_buf, remote_addr);
   }
 
   int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {

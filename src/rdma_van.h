@@ -132,14 +132,6 @@ class RDMAVan : public Van {
       return;
     }
 
-    if (disable_ipc_) {
-      is_local_[node.id] = false;
-    } else {
-      std::lock_guard<std::mutex> lock(local_mu_);
-      is_local_[node.id] = (node.hostname == my_node_.hostname) ? true : false;
-      LOG(INFO) << "IPC connected to " << node.id;
-    }
-
     if (node.id != Node::kEmpty) {
       auto it = endpoints_.find(node.id);
 
@@ -212,6 +204,16 @@ class RDMAVan : public Van {
         if (endpoint->status == Endpoint::CONNECTED) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
       }
+
+    local_mu_.lock();
+    if (disable_ipc_) {
+      is_local_[node.id] = false;
+    } else {
+      is_local_[node.id] = (node.hostname == my_node_.hostname) ? true : false;
+    }
+    LOG(INFO) << "Connect to Node " << node.id 
+              << " with Transport=" << (is_local_[node.id]?"IPC" : "RDMA");
+    local_mu_.unlock();
 
       std::shared_ptr<Transport> t = is_local_[node.id] ?
           std::make_shared<IPCTransport>(endpoint, send_mempool_.get()) :
@@ -607,6 +609,16 @@ class RDMAVan : public Van {
     }
 
     endpoint->Init(cq_, pd_);
+
+    local_mu_.lock();
+    if (disable_ipc_) {
+      is_local_[remote_ctx->node] = false;
+    } else {
+      is_local_[remote_ctx->node] = (std::string(remote_ctx->hostname) == my_node_.hostname) ? true : false;
+    }
+    LOG(INFO) << "OnConnect to Node " << remote_ctx->node 
+              << " with Transport=" << (is_local_[remote_ctx->node]?"IPC" : "RDMA");
+    local_mu_.unlock();
 
     std::shared_ptr<Transport> t = is_local_[remote_ctx->node] ?
         std::make_shared<IPCTransport>(endpoint, recv_mempool_.get()) :

@@ -255,7 +255,6 @@ class RDMATransport : public Transport {
     size_t num_sge = 1;
     
     if (msg_buf->mrs.size() == 3) { 
-      LOG(INFO) << "#########";
       // push request, split the meta and data into two writes
       // further, it does not send keys and lens since these meta already carries these info 
       struct ibv_sge my_sge;

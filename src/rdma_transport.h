@@ -170,8 +170,7 @@ struct Endpoint {
 class Transport {
  public:
    virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
-   virtual void PostRDMAWriteWithImm(MessageBuffer *msg_buf, struct ibv_sge *sge, size_t num_sge, 
-                                        uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
+   
    virtual int Recv(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
    virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
    virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
@@ -182,11 +181,11 @@ class Transport {
    virtual void RegisterMemory(Message &msg) = 0;
    virtual void PrepareData(Message &msg, MessageBuffer *msg_buf) = 0;
 
-   virtual void Send(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) = 0;
-   virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) = 0;
-   virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) = 0;
-   virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr)  = 0;
-   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) = 0;
+   virtual void Send(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
+   virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
+   virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
+   virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple)  = 0;
+   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
    virtual void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) = 0;
    virtual void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) = 0;
 
@@ -285,12 +284,7 @@ class RDMATransport : public Transport {
         ++num_sge;
       }
     }
-    PostRDMAWriteWithImm(msg_buf, sge, num_sge, remote_addr, rkey, idx);
-  }
-
-  void PostRDMAWriteWithImm(MessageBuffer *msg_buf, struct ibv_sge *sge, 
-                                size_t num_sge, uint64_t remote_addr, 
-                                uint32_t rkey, uint32_t idx) {
+    
     WRContext *write_ctx = msg_buf->reserved_context;
     CHECK(write_ctx);
     MessageBuffer **tmp =
@@ -414,27 +408,26 @@ class RDMATransport : public Transport {
     }
   }
 
-  void Send(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
-    auto recver = msg.meta.recver;
-    auto raddr = std::get<0>(remote_addr[recver]);
-    auto rkey = std::get<1>(remote_addr[recver]);
-    auto idx = std::get<2>(remote_addr[recver]);
+  void Send(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+    auto raddr = std::get<0>(remote_tuple);
+    auto rkey = std::get<1>(remote_tuple);
+    auto idx = std::get<2>(remote_tuple);
     RDMAWriteWithImm(msg_buf, raddr, rkey, idx);
   }
 
-  void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
-    Send(msg, msg_buf, remote_addr);
+  void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+    Send(msg, msg_buf, remote_tuple);
   }
 
-  void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
-    Send(msg, msg_buf, remote_addr);
+  void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+    Send(msg, msg_buf, remote_tuple);
   }
 
-  virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
-    Send(msg, msg_buf, remote_addr);
+  virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+    Send(msg, msg_buf, remote_tuple);
   }
 
-  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
+  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
     auto raddr = msg.meta.addr;
     auto rkey = msg.meta.option;
 
@@ -463,7 +456,7 @@ class RDMATransport : public Transport {
       << "ibv_post_send failed.";
 
     // after write keys/vals/lens (no imm), write the meta (with imm)
-    Send(msg, msg_buf, remote_addr);
+    Send(msg, msg_buf, remote_tuple);
   }
 
   virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) {
@@ -571,7 +564,7 @@ class IPCTransport : public RDMATransport {
     byteps_partition_bytes_ = val ? atoi(val) : 4096000;
 
     val = Environment::Get()->find("BYTEPS_LOCAL_SIZE");
-    auto byteps_local_size = val ? atoi(val) : 1;
+    auto byteps_local_size = val ? atoi(val) : 8;
     byteps_partition_bytes_ = RoundUp(byteps_partition_bytes_, byteps_local_size * sysconf(_SC_PAGESIZE));
 
     val = Environment::Get()->find("BYTEPS_IPC_ENABLE_ASYNC_COPY");
@@ -588,26 +581,26 @@ class IPCTransport : public RDMATransport {
     }
   }
 
-  void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
+  void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
     msg_buf->mrs.clear(); // avoid rdma-write in RDMAWriteWithImm()
     CHECK_EQ(msg_buf->mrs.size(), 0);
-    Send(msg, msg_buf, remote_addr);
+    Send(msg, msg_buf, remote_tuple);
   }
 
-  void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
+  void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
     CHECK_EQ(msg_buf->mrs.size(), 0);
     auto addr = (void*) CHECK_NOTNULL(msg.data[1].data());
     void* shm_addr = CHECK_NOTNULL(GetSharedMemory(kShmPrefix, msg.meta.key));
 
     if (enable_async_copy_) {
       // async copy with a simple load-balancing strategy
-      AsyncCopy m = {msg_buf, shm_addr, addr, msg.meta.val_len, remote_addr, msg.meta.recver, false};
+      AsyncCopy m = {msg_buf, remote_tuple, shm_addr, addr, msg.meta.val_len, false};
       auto cnt = cpy_counter_.fetch_add(1);
       async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
     } else {
       // synchronous copy
       memcpy(shm_addr, addr, msg.meta.val_len);
-      Send(msg, msg_buf, remote_addr);
+      Send(msg, msg_buf, remote_tuple);
     }
   }
 
@@ -635,11 +628,10 @@ class IPCTransport : public RDMATransport {
  private:
   struct AsyncCopy {
     MessageBuffer* msg_buf;
+    RemoteTuple remote_tuple;
     void* dst;
     void* src;
     int len;
-    RemoteAddress remote_addr;
-    int recver;
     bool shutdown;
   };
 
@@ -656,9 +648,9 @@ class IPCTransport : public RDMATransport {
       CHECK(m.src);
       memcpy(m.dst, m.src, m.len);
 
-      auto raddr = std::get<0>(m.remote_addr[m.recver]);
-      auto rkey  = std::get<1>(m.remote_addr[m.recver]);
-      auto idx   = std::get<2>(m.remote_addr[m.recver]);
+      auto raddr = std::get<0>(m.remote_tuple);
+      auto rkey  = std::get<1>(m.remote_tuple);
+      auto idx   = std::get<2>(m.remote_tuple);
       
       RDMAWriteWithImm(m.msg_buf, raddr, rkey, idx);
     }

@@ -270,29 +270,30 @@ class RDMAVan : public Van {
       return true;
     }
     // no remote info, store the msg_buf address and push/pull flag for RendezvousReply
-    msgbuf_cache_.emplace(reinterpret_cast<uint64_t>(msg_buf), std::make_tuple(key, is_push, recver));
+    auto buf_addr = reinterpret_cast<uint64_t>(msg_buf);
+    CHECK_EQ(msgbuf_cache_.find(buf_addr), msgbuf_cache_.end());
+    msgbuf_cache_.emplace(buf_addr, std::make_tuple(key, is_push, recver));
     return false;
   }
 
   void StoreRemoteInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
-    auto buf = reinterpret_cast<uint64_t>(msg_buf);
-    if (msgbuf_cache_.find(buf) == msgbuf_cache_.end()) return; // control message
     std::lock_guard<std::mutex> lk(addr_mu_);
-    auto key = std::get<0>(msgbuf_cache_[buf]);
-    auto is_push = std::get<1>(msgbuf_cache_[buf]);
-    auto recver = std::get<2>(msgbuf_cache_[buf]);
+    auto buf_addr = reinterpret_cast<uint64_t>(msg_buf);
+    if(msgbuf_cache_.find(buf_addr) == msgbuf_cache_.end()) { return; } // control message
+    auto key = std::get<0>(msgbuf_cache_[buf_addr]);
+    auto is_push = std::get<1>(msgbuf_cache_[buf_addr]);
+    auto recver = std::get<2>(msgbuf_cache_[buf_addr]);
     if (is_push) {
       push_addr_[key][recver] = std::make_tuple(remote_addr, rkey, idx);
     } else {
       pull_addr_[key][recver] = std::make_tuple(remote_addr, rkey, idx);
     }
-    CHECK_NE(msgbuf_cache_.find(buf), msgbuf_cache_.end());
-    msgbuf_cache_.erase(buf);
+    msgbuf_cache_.erase(buf_addr);
   }
 
-  RemoteAddress GetRemoteInfo(uint64_t key, bool is_push) {
+  RemoteTuple GetRemoteInfo(uint64_t key, bool is_push, int recver) {
     std::lock_guard<std::mutex> lk(addr_mu_);
-    return (is_push ? push_addr_[key] : pull_addr_[key]);
+    return (is_push ? push_addr_[key][recver] : pull_addr_[key][recver]);
   }
 
   int SendMsg(Message &msg) override {
@@ -336,21 +337,21 @@ class RDMAVan : public Van {
       }
     }
 
-    auto remote_addr_tuple = GetRemoteInfo(msg.meta.key, msg.meta.push);
+    auto remote_tuple = GetRemoteInfo(msg.meta.key, msg.meta.push, remote_id);
 
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
       // worker, push request
-      trans->SendPushRequest(msg, msg_buf, remote_addr_tuple);
+      trans->SendPushRequest(msg, msg_buf, remote_tuple);
     } else if (msg.meta.push && !msg.meta.request) { 
       // server, push response
-      trans->SendPushResponse(msg, msg_buf, remote_addr_tuple);
+      trans->SendPushResponse(msg, msg_buf, remote_tuple);
     } else if (!msg.meta.push && msg.meta.request) { 
       // worker, pull request
-      trans->SendPullRequest(msg, msg_buf, remote_addr_tuple);
+      trans->SendPullRequest(msg, msg_buf, remote_tuple);
     } else if (!msg.meta.push && !msg.meta.request) { 
       // server, pull response
-      trans->SendPullResponse(msg, msg_buf, remote_addr_tuple);
+      trans->SendPullResponse(msg, msg_buf, remote_tuple);
     } else {
       CHECK(0) << "unexpected message type";
     }

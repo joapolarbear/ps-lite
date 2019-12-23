@@ -228,16 +228,12 @@ class RDMATransport : public Transport {
 
   void PrepareData(Message &msg, MessageBuffer *msg_buf) {
     if (!msg.meta.push && !msg.meta.request) return; // pull response does not need data
-
     for (auto &sa : msg_buf->data) {
       if (sa.size() == 0) continue;
-
       std::lock_guard<std::mutex> lock(map_mu_);
       auto it = mem_mr_map_.find(sa.data());
       MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
-
       CHECK(ptr.get()) << strerror(errno);
-      
       msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
     }
   }
@@ -576,6 +572,10 @@ class IPCTransport : public RDMATransport {
     val = Environment::Get()->find("BYTEPS_LOCAL_SIZE");
     auto byteps_local_size = val ? atoi(val) : 1;
     byteps_partition_bytes_ = RoundUp(byteps_partition_bytes_, byteps_local_size * sysconf(_SC_PAGESIZE));
+
+    val = Environment::Get()->find("BYTEPS_IPC_ENABLE_ASYNC_COPY");
+    enable_async_copy_ = val ? atoi(val) : 1; // default enabled
+    if (!enable_async_copy_) LOG(INFO) << "Async copy has been disabled, this could affect the performance";
   };
 
   ~IPCTransport() {
@@ -588,26 +588,26 @@ class IPCTransport : public RDMATransport {
   }
 
   void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
-    msg_buf->mrs.clear();
+    msg_buf->mrs.clear(); // avoid rdma-write in RDMAWriteWithImm()
     CHECK_EQ(msg_buf->mrs.size(), 0);
     Send(msg, msg_buf, remote_addr);
   }
 
   void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
     CHECK_EQ(msg_buf->mrs.size(), 0);
-    std::lock_guard<std::mutex> lock(map_mu_);
     auto addr = (void*) CHECK_NOTNULL(msg.data[1].data());
-    void* shm_addr = GetSharedMemory(kShmPrefix, msg.meta.key);
-    CHECK(shm_addr);
+    void* shm_addr = CHECK_NOTNULL(GetSharedMemory(kShmPrefix, msg.meta.key));
 
-    /* async copy with a simple load-balancing strategy */
-    // AsyncCopy m = {msg_buf, shm_addr, addr, len, remote_addr, recver, false};
-    // auto cnt = cpy_counter_.fetch_add(1);
-    // async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
-    
-    // synchronous copy
-    memcpy(shm_addr, addr, msg.meta.val_len);
-    Send(msg, msg_buf, remote_addr);
+    if (enable_async_copy_) {
+      // async copy with a simple load-balancing strategy
+      AsyncCopy m = {msg_buf, shm_addr, addr, msg.meta.val_len, remote_addr, msg.meta.recver, false};
+      auto cnt = cpy_counter_.fetch_add(1);
+      async_copy_queue_[cnt % ipc_copy_nthreads_]->Push(m);
+    } else {
+      // synchronous copy
+      memcpy(shm_addr, addr, msg.meta.val_len);
+      Send(msg, msg_buf, remote_addr);
+    }
   }
 
   int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
@@ -655,19 +655,11 @@ class IPCTransport : public RDMATransport {
       CHECK(m.src);
       memcpy(m.dst, m.src, m.len);
 
-      struct ibv_sge sge[1];
-      sge[0].addr = reinterpret_cast<uint64_t>(m.msg_buf->inline_buf);
-      sge[0].length = m.msg_buf->inline_len;
-      sge[0].lkey = mempool_->LocalKey(m.msg_buf->inline_buf);
-      
       auto raddr = std::get<0>(m.remote_addr[m.recver]);
       auto rkey  = std::get<1>(m.remote_addr[m.recver]);
       auto idx   = std::get<2>(m.remote_addr[m.recver]);
-
-      WRContext *reserved = nullptr;
-      endpoint_->free_write_ctx.WaitAndPop(&reserved);
-      m.msg_buf->reserved_context = reserved;
-      PostRDMAWriteWithImm(m.msg_buf, sge, 1, raddr, rkey, idx);
+      
+      RDMAWriteWithImm(m.msg_buf, raddr, rkey, idx);
     }
   }
 
@@ -693,9 +685,8 @@ class IPCTransport : public RDMATransport {
     CHECK_NE(base_ptr, (void*) -1) << strerror(errno);
     key_shm_addr_[base_key] = base_ptr;
 
-    LOG(INFO) << "open Shared Memory: " << shm_name
-              << ", offset=" << offset
-              << ", (in bytes) size=" << total_shm_size;
+    PS_VLOG(1) << "open Shared Memory: " << shm_name << ", offset=" 
+        << offset << ", (in bytes) size=" << total_shm_size;
     return key_shm_addr_[base_key] + offset;
   }
 
@@ -708,6 +699,8 @@ class IPCTransport : public RDMATransport {
 
   std::mutex shm_mu_;
   std::unordered_map<uint64_t, void *> key_shm_addr_;
+
+  bool enable_async_copy_;
 
 }; // class IPCTransport
 

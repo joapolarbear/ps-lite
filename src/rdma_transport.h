@@ -435,11 +435,13 @@ class RDMATransport : public Transport {
   }
 
   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteAddress remote_addr) {
-    std::lock_guard<std::mutex> lock(map_mu_);
     auto raddr = msg.meta.addr;
     auto rkey = msg.meta.option;
+
+    map_mu_.lock();
     auto temp_mr = mem_mr_map_.find(msg_buf->data[1].data());
     CHECK_NE(temp_mr, mem_mr_map_.end());
+    map_mu_.unlock();
 
     struct ibv_sge sge;
     sge.addr = reinterpret_cast<uint64_t>(msg_buf->data[1].data());
@@ -473,7 +475,6 @@ class RDMATransport : public Transport {
   }
 
   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    std::lock_guard<std::mutex> lock(map_mu_);
     auto addr = msg->meta.addr;
 
     SArray<char> keys = CreateFunctionalSarray(&msg->meta.key, sizeof(Key));

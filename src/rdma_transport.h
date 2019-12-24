@@ -171,7 +171,6 @@ class Transport {
  public:
    virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
    
-   virtual int Recv(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
    virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
    virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
    virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
@@ -226,7 +225,7 @@ class RDMATransport : public Transport {
   }
 
   void PrepareData(Message &msg, MessageBuffer *msg_buf) {
-    if (!msg.meta.push && !msg.meta.request) return; // pull response does not need data
+    if (!(msg.meta.push && msg.meta.request)) return; // only push request
     for (auto &sa : msg_buf->data) {
       if (sa.size() == 0) continue;
       std::lock_guard<std::mutex> lock(map_mu_);
@@ -247,8 +246,6 @@ class RDMATransport : public Transport {
     sge[0].length = msg_buf->inline_len;
     sge[0].lkey = mempool_->LocalKey(msg_buf->inline_buf);
 
-    size_t num_sge = 1;
-    
     if (msg_buf->mrs.size() == 3) { 
       // push request, split the meta and data into two writes
       // further, it does not send keys and lens since these meta already carries these info 
@@ -274,15 +271,7 @@ class RDMATransport : public Transport {
         << "ibv_post_send failed.";
 
     } else {
-      for (auto &pair : msg_buf->mrs) {
-        size_t length = pair.second;      
-        CHECK(length);
-        sge[num_sge].addr =
-            reinterpret_cast<uint64_t>(pair.first->addr);
-        sge[num_sge].length = length;
-        sge[num_sge].lkey = pair.first->lkey;
-        ++num_sge;
-      }
+      CHECK_EQ(msg_buf->mrs.size(),0);
     }
     
     WRContext *write_ctx = msg_buf->reserved_context;
@@ -299,7 +288,7 @@ class RDMATransport : public Transport {
     wr.imm_data = idx;
     wr.send_flags = IBV_SEND_SIGNALED;
     wr.sg_list = sge;
-    wr.num_sge = num_sge;
+    wr.num_sge = 1;
     wr.wr.rdma.remote_addr = remote_addr;
     wr.wr.rdma.rkey = rkey;
 
@@ -412,6 +401,7 @@ class RDMATransport : public Transport {
     auto raddr = std::get<0>(remote_tuple);
     auto rkey = std::get<1>(remote_tuple);
     auto idx = std::get<2>(remote_tuple);
+
     RDMAWriteWithImm(msg_buf, raddr, rkey, idx);
   }
 
@@ -460,19 +450,55 @@ class RDMATransport : public Transport {
   }
 
   virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    return Recv(msg, buffer_ctx, meta_len);
+    CHECK_EQ(buffer_ctx->data_num, 0);
+    return 0;
   }
 
   virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    return Recv(msg, buffer_ctx, meta_len);
+    SArray<char> keys = CreateFunctionalSarray(&msg->meta.key, sizeof(Key));
+
+    SArray<char> vals; // add an empty sarray to pass kvapp check 
+
+    msg->data.push_back(keys);
+    msg->data.push_back(vals);
+
+    return keys.size() + vals.size();
+  }
+
+  virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
+    CHECK(msg->meta.push && msg->meta.request);
+    CHECK_EQ(buffer_ctx->data_num, 3);
+    uint32_t len = buffer_ctx->data_len[1];
+    char* cur = buffer_ctx->buffer + align_ceil((size_t) meta_len, pagesize_);
+    
+    SArray<char> keys = CreateFunctionalSarray(&msg->meta.key, sizeof(Key));
+
+    SArray<char> vals;
+    vals.reset(cur, len, [](void *) {});  // no need to delete
+
+    SArray<char> lens = CreateFunctionalSarray(&msg->meta.val_len, sizeof(int));
+
+    msg->data.push_back(keys);
+    msg->data.push_back(vals);
+    msg->data.push_back(lens);
+
+    return keys.size() + vals.size() + lens.size();
   }
 
   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    auto addr = msg->meta.addr;
+    LOG(INFO) << "RecvPullResponse: key=" << msg->meta.key 
+              << ", " << (msg->meta.push ? "push" : "pull") 
+              << " "  << (msg->meta.request ? "request" : "response")
+              << ", sender=" << msg->meta.sender
+              << ", meta_len=" << meta_len
+              << ", buffer_ctx=" << reinterpret_cast<uint64_t>(buffer_ctx)
+              << ", tensor_addr=" << msg->meta.addr
+              << ", val_len=" << msg->meta.val_len;
 
     SArray<char> keys = CreateFunctionalSarray(&msg->meta.key, sizeof(Key));
 
     SArray<char> vals;
+    auto addr = msg->meta.addr;
     vals.reset(reinterpret_cast<char*>(addr), msg->meta.val_len, [](void *){});
 
     SArray<char> lens = CreateFunctionalSarray(&msg->meta.val_len, sizeof(int));
@@ -480,11 +506,8 @@ class RDMATransport : public Transport {
     msg->data.push_back(keys);
     msg->data.push_back(vals);
     msg->data.push_back(lens);
-    return keys.size() + vals.size() + lens.size();
-  }
 
-  virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    return Recv(msg, buffer_ctx, meta_len);
+    return keys.size() + vals.size() + lens.size();
   }
 
   SArray<char> CreateFunctionalSarray(void *value, size_t size) {
@@ -495,47 +518,6 @@ class RDMATransport : public Transport {
     return sarr;
   }
 
- private:
-  virtual int Recv(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    uint64_t data_num = buffer_ctx->data_num;
-    if (data_num == 0) {
-      return 0;
-    }
-
-    char *cur = buffer_ctx->buffer + meta_len; // offset
-
-    if (msg->meta.push && msg->meta.request) { // push request
-      CHECK_EQ(data_num, 3);
-      uint32_t len = buffer_ctx->data_len[1];
-
-      cur = buffer_ctx->buffer + align_ceil((size_t) meta_len, pagesize_);
-      
-      SArray<char> keys = CreateFunctionalSarray(&msg->meta.key, sizeof(Key));
-
-      SArray<char> vals;
-      vals.reset(cur, len, [](void *) {});  // no need to delete
-
-      SArray<char> lens = CreateFunctionalSarray(&msg->meta.val_len, sizeof(int));
-
-      msg->data.push_back(keys);
-      msg->data.push_back(vals);
-      msg->data.push_back(lens);
-
-      return sizeof(Key) + len + sizeof(int);
-    }
-
-    int total_data_len = 0;
-    for (size_t i = 0; i < data_num; i++) {
-      uint32_t len = buffer_ctx->data_len[i];
-      SArray<char> data;
-      data.reset(cur, len, [](void *) {});  // no need for delete
-      msg->data.push_back(data);
-      cur += len;
-      total_data_len += len;
-    }
-    return total_data_len;
-  }
- 
  protected:
   size_t pagesize_ = 4096;
   Endpoint *endpoint_;

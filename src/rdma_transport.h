@@ -486,15 +486,6 @@ class RDMATransport : public Transport {
   }
 
   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    LOG(INFO) << "RecvPullResponse: key=" << msg->meta.key 
-              << ", " << (msg->meta.push ? "push" : "pull") 
-              << " "  << (msg->meta.request ? "request" : "response")
-              << ", sender=" << msg->meta.sender
-              << ", meta_len=" << meta_len
-              << ", buffer_ctx=" << reinterpret_cast<uint64_t>(buffer_ctx)
-              << ", tensor_addr=" << msg->meta.addr
-              << ", val_len=" << msg->meta.val_len;
-
     SArray<char> keys = CreateFunctionalSarray(&msg->meta.key, sizeof(Key));
 
     SArray<char> vals;

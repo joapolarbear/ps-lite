@@ -110,6 +110,8 @@ class SimpleMempool {
     // set init mempool size
     auto byteps_rdma_mempool_size = Environment::Get()->find("BYTEPS_RDMA_MEMPOOL_SIZE");
     size = byteps_rdma_mempool_size ? atoi(byteps_rdma_mempool_size) : size;
+    size = align_ceil(size, pagesize_);
+
     auto byteps_rdma_mempool_num = Environment::Get()->find("BYTEPS_RDMA_MEMPOOL_NUM");
     size_t mempool_num = byteps_rdma_mempool_num ? atoi(byteps_rdma_mempool_num) : 1;
     PS_VLOG(1) << "RDMA initial mempool size set to " << size
@@ -122,7 +124,7 @@ class SimpleMempool {
       CHECK(p);
       CHECK(mr = ibv_reg_mr(pd, p, size,
                             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
-      mr_list.emplace(p+size, mr); // this mr is associated with memory address range [p, p+size]
+      mr_list.emplace(p+size-1, mr); // this mr is associated with memory address range [p, p+size-1]
       free_list.emplace(size, p);
     }
   }
@@ -158,7 +160,7 @@ class SimpleMempool {
       CHECK(p);
       struct ibv_mr *mr;
       CHECK(mr = ibv_reg_mr(pd_, p, new_mem_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
-      mr_list.emplace(p+new_mem_size, mr);
+      mr_list.emplace(p+new_mem_size-1, mr);
       free_list.emplace(new_mem_size, p);
       it = free_list.lower_bound(proper_size);
       PS_VLOG(1) << "Not enough memory in the pool, requested size " << proper_size << ", new allocated size " << new_mem_size;

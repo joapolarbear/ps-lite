@@ -100,40 +100,16 @@ static inline void ib_malloc(void** ptr, size_t size) {
 
 class MemoryAllocator {
  public:
-  explicit MemoryAllocator(struct ibv_pd *pd, size_t size = 0x10000000) {
+  explicit MemoryAllocator(struct ibv_pd *pd) {
     std::lock_guard<std::mutex> lk(mu_);
     pd_ = pd;
-    struct ibv_mr *mr;
-
-    pagesize_ = sysconf(_SC_PAGESIZE);
-    
-    // set init mempool size
-    auto byteps_rdma_mempool_size = Environment::Get()->find("BYTEPS_RDMA_MEMPOOL_SIZE");
-    size = byteps_rdma_mempool_size ? atoi(byteps_rdma_mempool_size) : size;
-    size = align_ceil(size, pagesize_);
-
-    auto byteps_rdma_mempool_num = Environment::Get()->find("BYTEPS_RDMA_MEMPOOL_NUM");
-    size_t mempool_num = byteps_rdma_mempool_num ? atoi(byteps_rdma_mempool_num) : 1;
-    PS_VLOG(1) << "RDMA initial mempool size set to " << size
-               << ", mempool num set to " << mempool_num;
-    
-    for (size_t i = 0; i < mempool_num; ++i) {
-      char *p;
-      ib_malloc((void**) &p, size);
-      total_allocated_size += size;
-      CHECK(p);
-      CHECK(mr = ibv_reg_mr(pd, p, size,
-                            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
-      mr_list.emplace(p+size-1, mr); // this mr is associated with memory address range [p, p+size-1]
-      free_list.emplace(size, p);
-    }
   }
 
   ~MemoryAllocator() {
     std::lock_guard<std::mutex> lk(mu_);
-    for(auto it = mr_list.begin(); it != mr_list.end(); it++) {
-      CHECK_EQ(ibv_dereg_mr(it->second), 0);
-      free(it->second->addr);
+    for(auto &it : mr_) {
+      CHECK_EQ(ibv_dereg_mr(it.second), 0);
+      free(it.first);
     }
   }
 
@@ -142,74 +118,29 @@ class MemoryAllocator {
       return nullptr;
     }
 
+    // align to page size (usually 4KB)
+    size = align_ceil(size, pagesize_);
+
+    char *p;
+    ib_malloc((void**) &p, size);
+    CHECK(p);
+
+    struct ibv_mr *mr;
+    CHECK(mr = ibv_reg_mr(pd_, p, size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
+    
     std::lock_guard<std::mutex> lk(mu_);
+    mr_[p] = mr;
+    used_list.emplace(p, size);
 
-    // use page aligned memory
-    size_t proper_size = align_ceil(size, pagesize_);
-
-    auto it = free_list.lower_bound(proper_size);
-
-    // if there is no space left, need to allocate and register new memory
-    if (it == free_list.end()) { 
-      size_t new_mem_size = total_allocated_size;
-      while (proper_size > new_mem_size) {
-        new_mem_size *= 2;
-      }
-      char *p;
-      ib_malloc((void**) &p, new_mem_size);
-      CHECK(p);
-      struct ibv_mr *mr;
-      CHECK(mr = ibv_reg_mr(pd_, p, new_mem_size, IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE));
-      mr_list.emplace(p+new_mem_size-1, mr);
-      free_list.emplace(new_mem_size, p);
-      it = free_list.lower_bound(proper_size);
-      PS_VLOG(1) << "Not enough memory in the pool, requested size " << proper_size << ", new allocated size " << new_mem_size;
-      total_allocated_size += new_mem_size;
-    }
-
-    CHECK_NE(free_list.end(), it) << "Not enough memory";
-    CHECK_GE(it->first, proper_size);
-
-    char *addr = it->second;
-    size_t space_left = it->first - proper_size;
-
-    free_list.erase(it);
-    CHECK_EQ(used_list.find(addr), used_list.end())
-        << "Address is already allocated";
-
-    used_list.emplace(addr, proper_size);
-
-    if (space_left) {
-      free_list.emplace(space_left, addr + proper_size);
-    }
-
-    return addr;
-  }
-
-  void Free(char *addr) {
-    if (!addr) {
-      return;
-    }
-
-    std::lock_guard<std::mutex> lk(mu_);
-
-    auto it = used_list.find(addr);
-    CHECK_NE(used_list.end(), it)
-        << "Cannot find info about address: " << (uintptr_t)addr;
-
-    size_t size = it->second;
-    used_list.erase(it);
-    free_list.emplace(size, addr);
+    return p;
   }
 
   uint32_t LocalKey(char *addr) {
-    struct ibv_mr *mr = Addr2MR(addr);
-    return mr->lkey;
+    return Addr2MR(addr)->lkey;
   }
 
   uint32_t RemoteKey(char *addr) {
-    struct ibv_mr *mr = Addr2MR(addr);
-    return mr->rkey;
+    return Addr2MR(addr)->rkey;
   }
 
   struct ibv_pd* GetPD() {
@@ -217,25 +148,21 @@ class MemoryAllocator {
   }
 
  private:
-  std::mutex mu_;
-  std::multimap<size_t, char *> free_list;
-  std::unordered_map<char *, size_t> used_list;
-  struct ibv_pd *pd_;
-  size_t total_allocated_size = 0;
-  size_t pagesize_;
-
-  // first: `end` of this mr address (e.g., for mr with [addr, addr+size], point to `addr+size`)
-  std::map<char *, struct ibv_mr*> mr_list;
-
   // convert the memory address to its associated RDMA memory region
   inline struct ibv_mr* Addr2MR(char *addr) {
     std::lock_guard<std::mutex> lk(mu_);
-    auto it = mr_list.lower_bound(addr);
-    CHECK_NE(it, mr_list.end()) << "cannot find the associated memory region";
+    auto it = mr_.find(addr);
+    CHECK_NE(it, mr_.end()) 
+        << "cannot find the associated memory region";
+
     return it->second;
   }
 
-
+  std::mutex mu_;
+  struct ibv_pd *pd_;
+  size_t pagesize_ = sysconf(_SC_PAGESIZE);
+  std::unordered_map<char *, size_t> used_list;
+  std::unordered_map<char *, struct ibv_mr *> mr_;
 };
 
 enum MessageTypes : uint32_t {

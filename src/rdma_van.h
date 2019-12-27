@@ -474,19 +474,20 @@ class RDMAVan : public Van {
             << "Failed status \n"
             << ibv_wc_status_str(wc[i].status) << " " << wc[i].status << " "
             << static_cast<uint64_t>(wc[i].wr_id) << " " << wc[i].vendor_err;
-
+            
         WRContext *context = reinterpret_cast<WRContext *>(wc[i].wr_id);
         Endpoint *endpoint =
             reinterpret_cast<Endpoint *>(context->private_data);
 
-        CHECK(endpoint);
+        // IBV_WC_RDMA_WRITE use msg_buf as the wr_id
+        // so there won't be context and endpoint for this op
 
         switch (wc[i].opcode) {
-          case IBV_WC_SEND:
+          case IBV_WC_SEND: {
             ReleaseWorkRequestContext(context, endpoint);
-            break;
+          } break;
           case IBV_WC_RDMA_WRITE: {
-            ReleaseWorkRequestContext(context, endpoint);
+            // do nothing
           } break;
           case IBV_WC_RECV_RDMA_WITH_IMM: {
             uint32_t addr_idx = wc[i].imm_data;

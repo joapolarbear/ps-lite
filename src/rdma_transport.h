@@ -123,7 +123,7 @@ struct Endpoint {
     attr.sq_sig_all = 0;
 
     CHECK_EQ(rdma_create_qp(cm_id, pd, &attr), 0)
-        << "Create RDMA queue pair failed";
+        << "Create RDMA queue pair failed: " << strerror(errno);
 
     InitSendContextHelper(pd, start_ctx, &free_start_ctx, kStartDepth,
                           kRendezvousStartContext);
@@ -265,24 +265,15 @@ class RDMATransport : public Transport {
       CHECK_EQ(msg_buf->mrs.size(),0);
     }
 
-    WRContext *reserved = nullptr;
-    endpoint_->free_write_ctx.WaitAndPop(&reserved);
-    msg_buf->reserved_context = reserved;
     // prepare RDMA write sge list
     struct ibv_sge sge;
     sge.addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
     sge.length = msg_buf->inline_len;
     sge.lkey = allocator_->LocalKey(msg_buf->inline_buf);
     
-    WRContext *write_ctx = msg_buf->reserved_context;
-    CHECK(write_ctx);
-    MessageBuffer **tmp =
-        reinterpret_cast<MessageBuffer **>(write_ctx->buffer->addr);
-    *tmp = msg_buf;  // write the addr of msg_buf into the mr buffer
-
     struct ibv_send_wr wr, *bad_wr = nullptr;
     memset(&wr, 0, sizeof(wr));
-    wr.wr_id = reinterpret_cast<uint64_t>(write_ctx);
+    wr.wr_id = reinterpret_cast<uint64_t>(msg_buf);
     wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
     wr.next = nullptr;
     wr.imm_data = idx;
@@ -297,11 +288,9 @@ class RDMATransport : public Transport {
   }
 
   void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) {
-    WRContext *context = nullptr, *reserved = nullptr;
-    endpoint_->free_write_ctx.WaitAndPop(&reserved);
+    WRContext *context = nullptr;
     endpoint_->free_start_ctx.WaitAndPop(&context);
     
-    msg_buf->reserved_context = reserved;
     RendezvousStart *req =
         reinterpret_cast<RendezvousStart *>(context->buffer->addr);
     req->meta_len = msg_buf->inline_len;
@@ -335,7 +324,7 @@ class RDMATransport : public Transport {
     buf_ctx->meta_len = req->meta_len;
     buf_ctx->data_num = req->data_num;
 
-    auto data_len = 0;
+    size_t data_len = 0;
     for (size_t i = 0; i < req->data_num; ++i) {
       buf_ctx->data_len[i] = req->data_len[i];
       data_len += req->data_len[i];
@@ -343,7 +332,7 @@ class RDMATransport : public Transport {
     
     // worker only needs a buffer for receving meta
     char *buffer = allocator_->Alloc(
-        is_server_ ? (data_len + align_ceil(req->meta_len, pagesize_)) : req->meta_len);
+        is_server_ ? (align_ceil(req->meta_len, pagesize_) + data_len) : req->meta_len);
     CHECK(buffer);
     buf_ctx->buffer = buffer;
 

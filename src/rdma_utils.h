@@ -60,7 +60,7 @@ static const int kWriteDepth = kStartDepth * 2;
 static const int kRxDepth = kStartDepth + kWriteDepth;
 static const int kReplyDepth = kRxDepth;
 
-static const int kSGEntry = 4;
+static const int kSGEntry = 1;
 static const int kTimeoutms = 1000;
 static const int kRdmaListenBacklog = 128;
 static const int kMaxConcurrentWorkRequest =

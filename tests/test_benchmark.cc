@@ -6,6 +6,8 @@
 
 #define DIVUP(x, y) (((x)+(y)-1)/(y))
 #define ROUNDUP(x, y) (DIVUP((x), (y))*(y))
+#define DEBUG_PRINT_TENSOR_VALUE(X) (*((float *)(X) + 0))
+#define DEBUG_PRINT_TENSOR_ADDRESS(X) (reinterpret_cast<uint64_t>(X))
 
 using namespace ps;
 
@@ -16,6 +18,7 @@ enum MODE {
     PULL_ONLY = 3
 };
 std::unordered_map<uint64_t, KVPairs<char> > mem_map;
+bool debug_mode_ = false;
 
 void aligned_memory_alloc(void** ptr, size_t size) {
   size_t page_size = sysconf(_SC_PAGESIZE);
@@ -24,8 +27,14 @@ void aligned_memory_alloc(void** ptr, size_t size) {
   int ret = posix_memalign(&p, page_size, size_aligned);
   CHECK_EQ(ret, 0) << "posix_memalign error: " << strerror(ret);
   CHECK(p);
-  memset(p, 0, size);
+  memset(p, 1, size);
   *ptr = p;
+}
+
+void float_sum(float *dst, float *src, size_t len) {
+  for (size_t i = 0; i < len / (size_t) sizeof(float); ++i) {
+    dst[i] = dst[i] + src[i];
+  }
 }
 
 template <typename Val>
@@ -35,6 +44,8 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
     CHECK(req_data.lens.size());
     CHECK_EQ(req_data.vals.size(), (size_t)req_data.lens[0]) 
         << "key=" << key << ", " << req_data.vals.size() << ", " << req_data.lens[0];
+
+    size_t tensor_len = req_data.vals.size();
 
     if (mem_map.find(key) == mem_map.end()) {
       size_t len = (size_t) req_data.vals.size();
@@ -54,6 +65,18 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
       memcpy(ptr_len, &len, sizeof(int));
     }
 
+    auto recved = reinterpret_cast<char*>(req_data.vals.data());
+    float_sum((float*) mem_map[key].vals.data(), (float*) recved, tensor_len);
+
+    if (debug_mode_) {
+      LOG(INFO) << "recved tensor! key=" << key << "\t"
+          << "store: " << DEBUG_PRINT_TENSOR_VALUE(mem_map[key].vals.data()) << "\t"
+          << "recv: " << DEBUG_PRINT_TENSOR_VALUE(recved) << "\t"
+          << "address: " << DEBUG_PRINT_TENSOR_ADDRESS(recved) << "\t"
+          << "len: " << req_data.vals.size() << "\t"
+          << "sender: " << req_meta.sender;
+    }
+
     // send push response (empty)
     KVPairs<char> res;
     server->Response(req_meta, res);
@@ -67,6 +90,8 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
 
 void StartServer() {
   if (!IsServer()) return;
+  debug_mode_ = Environment::Get()->find("DEBUG_MODE") ? true : false;
+
   auto server = new KVServer<char>(0);
   server->set_request_handle(EmptyHandler<char>);
   RegisterExitCallback([server]() { delete server; });

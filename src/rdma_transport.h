@@ -343,7 +343,7 @@ class RDMATransport : public Transport {
     
     // worker only needs a buffer for receving meta
     char *buffer = allocator_->Alloc(
-        is_server_ ? (data+len + align_ceil(req->meta_len, pagesize_)) : req->meta_len);
+        is_server_ ? (data_len + align_ceil(req->meta_len, pagesize_)) : req->meta_len);
     CHECK(buffer);
     buf_ctx->buffer = buffer;
 

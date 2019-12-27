@@ -335,17 +335,18 @@ class RDMATransport : public Transport {
     buf_ctx->meta_len = req->meta_len;
     buf_ctx->data_num = req->data_num;
 
-    uint64_t len = req->meta_len;
+    auto data_len = 0;
     for (size_t i = 0; i < req->data_num; ++i) {
       buf_ctx->data_len[i] = req->data_len[i];
-      len += req->data_len[i];
+      data_len += req->data_len[i];
     }
     
     // worker only needs a buffer for receving meta
-    char *buffer = 
-        allocator_->Alloc(is_server_ ? (kMaxMetaBound + len) : (kMaxMetaBound + req->meta_len));
+    char *buffer = allocator_->Alloc(
+        is_server_ ? (data+len + align_ceil(req->meta_len, pagesize_)) : req->meta_len);
     CHECK(buffer);
     buf_ctx->buffer = buffer;
+
     WRContext *reply_ctx = nullptr;
     endpoint_->free_reply_ctx.WaitAndPop(&reply_ctx);
 

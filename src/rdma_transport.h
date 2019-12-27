@@ -195,9 +195,9 @@ class Transport {
 
 class RDMATransport : public Transport {
  public:
-  explicit RDMATransport(Endpoint *endpoint, SimpleMempool *mempool) {
+  explicit RDMATransport(Endpoint *endpoint, MemoryAllocator *allocator) {
     endpoint_ = CHECK_NOTNULL(endpoint);
-    mempool_ = CHECK_NOTNULL(mempool);
+    allocator_ = CHECK_NOTNULL(allocator);
     pagesize_ = sysconf(_SC_PAGESIZE);
 
     auto val = Environment::Get()->find("DMLC_ROLE");
@@ -215,7 +215,7 @@ class RDMATransport : public Transport {
       std::lock_guard<std::mutex> lock(map_mu_);
       if (mem_mr_map_.find(sa.data()) == mem_mr_map_.end()) {
         struct ibv_mr *temp_mr;
-        CHECK (temp_mr = ibv_reg_mr(mempool_->GetPD(), sa.data(), sa.size(),
+        CHECK (temp_mr = ibv_reg_mr(allocator_->GetPD(), sa.data(), sa.size(),
             IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
             << "Failed to register the memory region: " << strerror(errno)
             << ", sa.size()=" << sa.size();
@@ -237,15 +237,6 @@ class RDMATransport : public Transport {
   }
 
   virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
-    WRContext *reserved = nullptr;
-    endpoint_->free_write_ctx.WaitAndPop(&reserved);
-    msg_buf->reserved_context = reserved;
-    // prepare RDMA write sge list
-    struct ibv_sge sge[1 + msg_buf->mrs.size()];
-    sge[0].addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
-    sge[0].length = msg_buf->inline_len;
-    sge[0].lkey = mempool_->LocalKey(msg_buf->inline_buf);
-
     if (msg_buf->mrs.size() == 3) { 
       // push request, split the meta and data into two writes
       // further, it does not send keys and lens since these meta already carries these info 
@@ -273,6 +264,15 @@ class RDMATransport : public Transport {
     } else {
       CHECK_EQ(msg_buf->mrs.size(),0);
     }
+
+    WRContext *reserved = nullptr;
+    endpoint_->free_write_ctx.WaitAndPop(&reserved);
+    msg_buf->reserved_context = reserved;
+    // prepare RDMA write sge list
+    struct ibv_sge sge;
+    sge.addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
+    sge.length = msg_buf->inline_len;
+    sge.lkey = allocator_->LocalKey(msg_buf->inline_buf);
     
     WRContext *write_ctx = msg_buf->reserved_context;
     CHECK(write_ctx);
@@ -287,7 +287,7 @@ class RDMATransport : public Transport {
     wr.next = nullptr;
     wr.imm_data = idx;
     wr.send_flags = IBV_SEND_SIGNALED;
-    wr.sg_list = sge;
+    wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.wr.rdma.remote_addr = remote_addr;
     wr.wr.rdma.rkey = rkey;
@@ -343,7 +343,7 @@ class RDMATransport : public Transport {
     
     // worker only needs a buffer for receving meta
     char *buffer = 
-        mempool_->Alloc(is_server_ ? (kMaxMetaBound + len) : (kMaxMetaBound + req->meta_len));
+        allocator_->Alloc(is_server_ ? (kMaxMetaBound + len) : (kMaxMetaBound + req->meta_len));
     CHECK(buffer);
     buf_ctx->buffer = buffer;
     WRContext *reply_ctx = nullptr;
@@ -353,7 +353,7 @@ class RDMATransport : public Transport {
         reinterpret_cast<RendezvousReply *>(reply_ctx->buffer->addr);
 
     resp->addr = reinterpret_cast<uint64_t>(buffer);
-    resp->rkey = mempool_->RemoteKey(buffer);
+    resp->rkey = allocator_->RemoteKey(buffer);
     resp->origin_addr = req->origin_addr;
     resp->idx = addrpool.StoreAddress(buf_ctx);
 
@@ -512,7 +512,7 @@ class RDMATransport : public Transport {
  protected:
   size_t pagesize_ = 4096;
   Endpoint *endpoint_;
-  SimpleMempool *mempool_;
+  MemoryAllocator *allocator_;
   bool is_server_;
   std::mutex map_mu_;
   std::unordered_map<char*, struct ibv_mr*> mem_mr_map_; // (memory, ibv_mr) 
@@ -522,7 +522,7 @@ class RDMATransport : public Transport {
 class IPCTransport : public RDMATransport {
  public:
 
-  explicit IPCTransport(Endpoint *endpoint, SimpleMempool *mempool) : RDMATransport(endpoint, mempool) {
+  explicit IPCTransport(Endpoint *endpoint, MemoryAllocator *allocator) : RDMATransport(endpoint, allocator) {
     auto val = Environment::Get()->find("BYTEPS_IPC_COPY_NUM_THREADS");
     ipc_copy_nthreads_ = val ? atoi(val) : 4;
     for (int i = 0; i < ipc_copy_nthreads_; ++i) {

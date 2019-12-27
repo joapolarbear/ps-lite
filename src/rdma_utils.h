@@ -98,9 +98,9 @@ static inline void ib_malloc(void** ptr, size_t size) {
   *ptr = p;
 }
 
-class SimpleMempool {
+class MemoryAllocator {
  public:
-  explicit SimpleMempool(struct ibv_pd *pd, size_t size = 0x10000000) {
+  explicit MemoryAllocator(struct ibv_pd *pd, size_t size = 0x10000000) {
     std::lock_guard<std::mutex> lk(mu_);
     pd_ = pd;
     struct ibv_mr *mr;
@@ -129,7 +129,7 @@ class SimpleMempool {
     }
   }
 
-  ~SimpleMempool() {
+  ~MemoryAllocator() {
     std::lock_guard<std::mutex> lk(mu_);
     for(auto it = mr_list.begin(); it != mr_list.end(); it++) {
       CHECK_EQ(ibv_dereg_mr(it->second), 0);
@@ -206,6 +206,7 @@ class SimpleMempool {
     struct ibv_mr *mr = Addr2MR(addr);
     return mr->lkey;
   }
+
   uint32_t RemoteKey(char *addr) {
     struct ibv_mr *mr = Addr2MR(addr);
     return mr->rkey;
@@ -221,6 +222,7 @@ class SimpleMempool {
   std::unordered_map<char *, size_t> used_list;
   struct ibv_pd *pd_;
   size_t total_allocated_size = 0;
+  size_t pagesize_;
 
   // first: `end` of this mr address (e.g., for mr with [addr, addr+size], point to `addr+size`)
   std::map<char *, struct ibv_mr*> mr_list;
@@ -233,31 +235,7 @@ class SimpleMempool {
     return it->second;
   }
 
-  size_t pagesize_;
 
-};
-
-class Block {
- public:
-  explicit Block(SimpleMempool *pool, char *addr, int count)
-      : pool(pool), addr(addr), counter(count) {}
-
-  ~Block() {
-    CHECK_EQ(counter, 0);
-    pool->Free(addr);
-  }
-
-  void Release() {
-    int v = counter.fetch_sub(1);
-    if (v == 1) {
-      delete this;
-    }
-  }
-
- private:
-  SimpleMempool *pool;
-  char *addr;
-  std::atomic<int> counter;
 };
 
 enum MessageTypes : uint32_t {
@@ -302,12 +280,6 @@ struct BufferContext {
 typedef std::unique_ptr<struct ibv_mr, std::function<void(struct ibv_mr *)>>
     MRPtr;
 
-// <remote_addr, rkey, idx> 
-typedef std::tuple<uint64_t, uint32_t, uint32_t> RemoteTuple;  
-
-// recver, <remote_addr, rkey, idx> 
-typedef std::unordered_map<int, RemoteTuple>  RemoteAddress;  
-
 struct MessageBuffer {
   size_t inline_len;
   char *inline_buf;
@@ -321,6 +293,12 @@ struct RequestContext {
   uint16_t port;
   char hostname[kMaxHostnameLength];
 };
+
+// <remote_addr, rkey, idx, local_addr> 
+typedef std::tuple<uint64_t, uint32_t, uint32_t, MessageBuffer*> RemoteTuple;  
+
+// recver, <remote_addr, rkey, idx> 
+typedef std::unordered_map<int, RemoteTuple> RemoteAndLocalAddress;  
 
 static_assert(std::is_pod<RendezvousStart>::value,
               "RendezvousStart must be a POD type.");

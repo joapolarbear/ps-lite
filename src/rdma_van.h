@@ -66,9 +66,8 @@ class RDMAVan : public Van {
     cm_event_polling_thread_->join();
     cm_event_polling_thread_.reset();
 
-    PS_VLOG(1) << "Clearing mempool.";
-    send_mempool_.reset();
-    recv_mempool_.reset();
+    PS_VLOG(1) << "Clearing memory allocator.";
+    mem_allocator_.reset();
 
     PS_VLOG(1) << "Clearing endpoints.";
     incoming_.clear();
@@ -216,8 +215,8 @@ class RDMAVan : public Van {
     local_mu_.unlock();
 
       std::shared_ptr<Transport> t = is_local_[node.id] ?
-          std::make_shared<IPCTransport>(endpoint, send_mempool_.get()) :
-          std::make_shared<RDMATransport>(endpoint, send_mempool_.get());
+          std::make_shared<IPCTransport>(endpoint, mem_allocator_.get()) :
+          std::make_shared<RDMATransport>(endpoint, mem_allocator_.get());
       endpoint->SetTransport(t);
 
       freeaddrinfo(remote_addr);
@@ -259,7 +258,7 @@ class RDMAVan : public Van {
     }
   }
 
-  bool HasRemoteInfo(MessageBuffer *msg_buf, uint64_t key, bool is_push, int recver) {
+  bool HasRemoteInfo(Message& msg, uint64_t key, bool is_push, int recver) {
     std::lock_guard<std::mutex> lk(addr_mu_);
     if (is_push && (push_addr_.find(key) != push_addr_.end()) 
         && (push_addr_[key].find(recver) != push_addr_[key].end())) {
@@ -269,31 +268,46 @@ class RDMAVan : public Van {
         && (pull_addr_[key].find(recver) != pull_addr_[key].end())) {
       return true;
     }
-    // no remote info, store the msg_buf address and push/pull flag for RendezvousReply
-    auto buf_addr = reinterpret_cast<uint64_t>(msg_buf);
-    CHECK_EQ(msgbuf_cache_.find(buf_addr), msgbuf_cache_.end());
-    msgbuf_cache_.emplace(buf_addr, std::make_tuple(key, is_push, recver));
+
     return false;
   }
 
-  void StoreRemoteInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
+  void StoreMsgBuf(MessageBuffer *msg_buf, uint64_t key, bool is_push, int recver) {
     std::lock_guard<std::mutex> lk(addr_mu_);
-    auto buf_addr = reinterpret_cast<uint64_t>(msg_buf);
-    if(msgbuf_cache_.find(buf_addr) == msgbuf_cache_.end()) { return; } // control message
-    auto key = std::get<0>(msgbuf_cache_[buf_addr]);
-    auto is_push = std::get<1>(msgbuf_cache_[buf_addr]);
-    auto recver = std::get<2>(msgbuf_cache_[buf_addr]);
+    CHECK_EQ(msgbuf_cache_.find(msg_buf), msgbuf_cache_.end());
+    msgbuf_cache_[msg_buf] = std::make_tuple(key, is_push, recver);
+  }
+  
+  void StoreRemoteAndLocalInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
+    std::lock_guard<std::mutex> lk(addr_mu_);
+
+    CHECK_NE(msgbuf_cache_.find(msg_buf), msgbuf_cache_.end());
+    
+    auto key = std::get<0>(msgbuf_cache_[msg_buf]);
+    auto is_push = std::get<1>(msgbuf_cache_[msg_buf]);
+    auto recver = std::get<2>(msgbuf_cache_[msg_buf]);
+
+    auto t = std::make_tuple(remote_addr, rkey, idx, msg_buf);
     if (is_push) {
-      push_addr_[key][recver] = std::make_tuple(remote_addr, rkey, idx);
+      push_addr_[key][recver] = t;
     } else {
-      pull_addr_[key][recver] = std::make_tuple(remote_addr, rkey, idx);
+      pull_addr_[key][recver] = t;
     }
-    msgbuf_cache_.erase(buf_addr);
   }
 
-  RemoteTuple GetRemoteInfo(uint64_t key, bool is_push, int recver) {
+  RemoteTuple GetRemoteAndLocalInfo(uint64_t key, bool is_push, int recver) {
     std::lock_guard<std::mutex> lk(addr_mu_);
     return (is_push ? push_addr_[key][recver] : pull_addr_[key][recver]);
+  }
+
+  MessageBuffer* PrepareNewMsgBuf(Message& msg) {
+    MessageBuffer *msg_buf = new MessageBuffer();
+    auto meta_len = GetPackMetaLen(msg.meta);
+    msg_buf->inline_len = meta_len;
+    msg_buf->inline_buf = mem_allocator_->Alloc(meta_len);
+    msg_buf->data = msg.data;
+    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
+    return msg_buf;
   }
 
   int SendMsg(Message &msg) override {
@@ -302,56 +316,61 @@ class RDMAVan : public Van {
     CHECK_NE(endpoints_.find(remote_id), endpoints_.end());
     Endpoint *endpoint = endpoints_[remote_id].get();
 
-    auto trans = CHECK_NOTNULL(endpoint->GetTransport());
-    trans->RegisterMemory(msg);
-
-    MessageBuffer *msg_buf = new MessageBuffer();
-
     int meta_len = GetPackMetaLen(msg.meta);
-
     size_t data_len = msg.meta.data_size;
     size_t total_len = meta_len + data_len;
     CHECK(meta_len);
 
-    msg_buf->inline_len = meta_len;
-    msg_buf->inline_buf = send_mempool_->Alloc(meta_len);
-    msg_buf->data = msg.data;
+    auto trans = CHECK_NOTNULL(endpoint->GetTransport());
+    trans->RegisterMemory(msg);
 
+    // pack meta info
     if (IsValidPushpull(msg)) {
       trans->AddMeta(msg);
       PackWorkerTensorAddress(msg);
     }
 
-    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
-
+    // start rendezvous if no remote info
     if (!IsValidPushpull(msg)) { 
+      MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);
+      StoreMsgBuf(msg_buf, 0, 0, -1);
       trans->SendRendezvousBegin(msg, msg_buf);
       return total_len;
+
     } else {
-      trans->PrepareData(msg, msg_buf);
       auto is_push = msg.meta.push;
       auto key = msg.meta.key;
-      if (!HasRemoteInfo(msg_buf, key, is_push, remote_id)) {
+      if (!HasRemoteInfo(msg, key, is_push, remote_id)) {
+        MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);
+        StoreMsgBuf(msg_buf, key, is_push, remote_id);
+        trans->PrepareData(msg, msg_buf);
         trans->SendRendezvousBegin(msg, msg_buf);
         return total_len;
-      }
+      } 
     }
 
-    auto remote_tuple = GetRemoteInfo(msg.meta.key, msg.meta.push, remote_id);
+    auto addr_tuple = GetRemoteAndLocalInfo(msg.meta.key, msg.meta.push, remote_id);
+    MessageBuffer *msg_buf = std::get<3>(addr_tuple); // local message buffer
+    
+    // prepare new meta and data
+    CHECK_EQ(msg_buf->inline_len, meta_len);
+    CHECK(msg_buf->inline_buf);
+    msg_buf->data = msg.data; // may not need this
+    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
 
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
       // worker, push request
-      trans->SendPushRequest(msg, msg_buf, remote_tuple);
+      trans->SendPushRequest(msg, msg_buf, addr_tuple);
     } else if (msg.meta.push && !msg.meta.request) { 
       // server, push response
-      trans->SendPushResponse(msg, msg_buf, remote_tuple);
+      trans->SendPushResponse(msg, msg_buf, addr_tuple);
     } else if (!msg.meta.push && msg.meta.request) { 
       // worker, pull request
-      trans->SendPullRequest(msg, msg_buf, remote_tuple);
+      trans->SendPullRequest(msg, msg_buf, addr_tuple);
     } else if (!msg.meta.push && !msg.meta.request) { 
       // server, pull response
-      trans->SendPullResponse(msg, msg_buf, remote_tuple);
+      trans->SendPullResponse(msg, msg_buf, addr_tuple);
     } else {
       CHECK(0) << "unexpected message type";
     }
@@ -381,8 +400,6 @@ class RDMAVan : public Van {
     auto trans = CHECK_NOTNULL(endpoint->GetTransport());
 
     if (!IsValidPushpull(*msg)) {
-      recv_mempool_->Free(buffer_ctx->buffer);
-      delete buffer_ctx;
       return total_len;
     }
 
@@ -415,8 +432,7 @@ class RDMAVan : public Van {
     pd_ = ibv_alloc_pd(context_);
     CHECK(pd_) << "Failed to allocate protection domain";
 
-    send_mempool_.reset(new SimpleMempool(pd_));
-    recv_mempool_.reset(new SimpleMempool(pd_));
+    mem_allocator_.reset(new MemoryAllocator(pd_));
 
     comp_event_channel_ = ibv_create_comp_channel(context_);
 
@@ -470,10 +486,6 @@ class RDMAVan : public Van {
             ReleaseWorkRequestContext(context, endpoint);
             break;
           case IBV_WC_RDMA_WRITE: {
-            MessageBuffer *msg_buf =
-                *reinterpret_cast<MessageBuffer **>(context->buffer->addr);
-            send_mempool_->Free(msg_buf->inline_buf);
-            delete msg_buf;
             ReleaseWorkRequestContext(context, endpoint);
           } break;
           case IBV_WC_RECV_RDMA_WITH_IMM: {
@@ -507,7 +519,7 @@ class RDMAVan : public Van {
 
               // Before RDMA write, store the remote info so that 
               // subsequent write does not need repeated rendezvous 
-              StoreRemoteInfo(msg_buf, remote_addr, rkey, idx);
+              StoreRemoteAndLocalInfo(msg_buf, remote_addr, rkey, idx);
               trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
             } else {
               CHECK(0);
@@ -622,8 +634,8 @@ class RDMAVan : public Van {
     local_mu_.unlock();
 
     std::shared_ptr<Transport> t = is_local_[remote_ctx->node] ?
-        std::make_shared<IPCTransport>(endpoint, recv_mempool_.get()) :
-        std::make_shared<RDMATransport>(endpoint, recv_mempool_.get());
+        std::make_shared<IPCTransport>(endpoint, mem_allocator_.get()) :
+        std::make_shared<RDMATransport>(endpoint, mem_allocator_.get());
     endpoint->SetTransport(t);
 
     RequestContext ctx;
@@ -709,8 +721,7 @@ class RDMAVan : public Van {
   }
 
   AddressPool<BufferContext> addr_pool_;
-  std::unique_ptr<SimpleMempool> recv_mempool_;
-  std::unique_ptr<SimpleMempool> send_mempool_;
+  std::unique_ptr<MemoryAllocator> mem_allocator_;
 
   std::unique_ptr<RDMATransport> rdma_trans_;
   std::unique_ptr<IPCTransport> ipc_trans_;
@@ -748,11 +759,12 @@ class RDMAVan : public Van {
   using RemoteTensorMeta = std::unordered_map<int, TensorInfo>; // sender as the key
   std::unordered_map<ps::Key, RemoteTensorMeta> tensor_info_map_; // (key, sender) --> TensorInfo
 
-  // store rendezvous address
   std::mutex addr_mu_;
-  std::unordered_map<uint64_t, RemoteAddress> push_addr_; // <key, recver>, <remote_addr, rkey, idx>
-  std::unordered_map<uint64_t, RemoteAddress> pull_addr_; // <key, recver>, <remote_addr, rkey, idx>
-  std::unordered_map<uint64_t, std::tuple<uint64_t, bool, int> > msgbuf_cache_; // msg_buf, <key, is_push, recver>
+  // <key, recver>, (<remote_addr, rkey, idx, local_addr>)
+  std::unordered_map<uint64_t, RemoteAndLocalAddress> push_addr_; 
+  std::unordered_map<uint64_t, RemoteAndLocalAddress> pull_addr_; 
+  std::unordered_map<MessageBuffer*, std::tuple<uint64_t, bool, int> > msgbuf_cache_; // msg_buf, <key, is_push, recver>
+
 };  // class RDMAVan
 
 };  // namespace ps

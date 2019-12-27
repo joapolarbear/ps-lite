@@ -32,6 +32,7 @@ void aligned_memory_alloc(void** ptr, size_t size) {
 }
 
 void float_sum(float *dst, float *src, size_t len) {
+  if (len == 0) return;
   for (size_t i = 0; i < len / (size_t) sizeof(float); ++i) {
     dst[i] = dst[i] + src[i];
   }
@@ -45,7 +46,6 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
     CHECK_EQ(req_data.vals.size(), (size_t)req_data.lens[0]) 
         << "key=" << key << ", " << req_data.vals.size() << ", " << req_data.lens[0];
 
-    size_t tensor_len = req_data.vals.size();
 
     if (mem_map.find(key) == mem_map.end()) {
       size_t len = (size_t) req_data.vals.size();
@@ -66,7 +66,9 @@ void EmptyHandler(const KVMeta &req_meta, const KVPairs<Val> &req_data, KVServer
     }
 
     auto recved = reinterpret_cast<char*>(req_data.vals.data());
-    float_sum((float*) mem_map[key].vals.data(), (float*) recved, tensor_len);
+    // only sum the first 4 bytes
+    size_t sum_len = debug_mode_ ? req_data.vals.size() : 0;
+    float_sum((float*) mem_map[key].vals.data(), (float*) recved, sum_len);
 
     if (debug_mode_) {
       LOG(INFO) << "recved tensor! key=" << key << "\t"

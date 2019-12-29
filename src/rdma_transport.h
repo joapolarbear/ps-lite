@@ -38,11 +38,9 @@ struct Endpoint {
 
   WRContext start_ctx[kStartDepth];
   WRContext reply_ctx[kReplyDepth];
-  WRContext write_ctx[kWriteDepth];
 
   ThreadsafeQueue<WRContext *> free_start_ctx;
   ThreadsafeQueue<WRContext *> free_reply_ctx;
-  ThreadsafeQueue<WRContext *> free_write_ctx;
 
   Endpoint() : status(IDLE), node_id(Node::kEmpty), cm_id(nullptr), rx_ctx() {}
 
@@ -66,13 +64,6 @@ struct Endpoint {
       if (reply_ctx[i].buffer) {
         free(reply_ctx[i].buffer->addr);
         CHECK_EQ(ibv_dereg_mr(reply_ctx[i].buffer), 0);
-      }
-    }
-
-    for (int i = 0; i < kWriteDepth; ++i) {
-      if (write_ctx[i].buffer) {
-        free(write_ctx[i].buffer->addr);
-        CHECK_EQ(ibv_dereg_mr(write_ctx[i].buffer), 0);
       }
     }
 
@@ -115,7 +106,7 @@ struct Endpoint {
     memset(&attr, 0, sizeof(ibv_qp_init_attr));
     attr.send_cq = cq;
     attr.recv_cq = cq;
-    attr.cap.max_send_wr = kStartDepth + kReplyDepth + kWriteDepth;
+    attr.cap.max_send_wr = kStartDepth + kReplyDepth;
     attr.cap.max_recv_wr = kRxDepth;
     attr.cap.max_send_sge = kSGEntry;
     attr.cap.max_recv_sge = kSGEntry;
@@ -129,8 +120,6 @@ struct Endpoint {
                           kRendezvousStartContext);
     InitSendContextHelper(pd, reply_ctx, &free_reply_ctx, kReplyDepth,
                           kRendezvousReplyContext);
-    InitSendContextHelper(pd, write_ctx, &free_write_ctx, kWriteDepth,
-                          kWriteContext);
 
     for (size_t i = 0; i < kRxDepth; ++i) {
       void *buf;

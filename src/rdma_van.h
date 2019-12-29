@@ -452,9 +452,6 @@ class RDMAVan : public Van {
       case kRendezvousReplyContext:
         endpoint->free_reply_ctx.Push(context);
         break;
-      case kWriteContext:
-        endpoint->free_write_ctx.Push(context);
-        break;
       case kReceiveContext:
         endpoint->PostRecv(context);
         break;

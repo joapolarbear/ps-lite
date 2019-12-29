@@ -158,26 +158,26 @@ struct Endpoint {
 
 class Transport {
  public:
-   virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
-   
-   virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
-   virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
-   virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
-   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
+  virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) = 0;
   
-   virtual void AddMeta(Message &msg) = 0;
-   virtual void RegisterMemory(Message &msg) = 0;
-   virtual void PrepareData(Message &msg, MessageBuffer *msg_buf) = 0;
+  virtual int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
+  virtual int RecvPullRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
+  virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
+  virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
 
-   virtual void Send(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
-   virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
-   virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
-   virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple)  = 0;
-   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
-   virtual void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) = 0;
-   virtual void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) = 0;
+  virtual void AddMeta(Message &msg) = 0;
+  virtual void RegisterMemory(Message &msg) = 0;
+  virtual void PrepareData(Message &msg, MessageBuffer *msg_buf) = 0;
 
-   virtual SArray<char> CreateFunctionalSarray(void *value, size_t size) = 0;
+  virtual void Send(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
+  virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
+  virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
+  virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple)  = 0;
+  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
+  virtual void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) = 0;
+  virtual void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) = 0;
+
+  virtual SArray<char> CreateFunctionalSarray(void *value, size_t size) = 0;
 
 }; // class Transport
 
@@ -226,35 +226,6 @@ class RDMATransport : public Transport {
   }
 
   virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
-    if (msg_buf->mrs.size() == 3) { 
-      // push request, split the meta and data into two writes
-      // further, it does not send keys and lens since these meta already carries these info 
-      struct ibv_sge my_sge;
-      my_sge.addr = reinterpret_cast<uint64_t>(msg_buf->mrs[1].first->addr);
-      my_sge.length = msg_buf->mrs[1].second;
-      my_sge.lkey = msg_buf->mrs[1].first->lkey;
-
-      // this rdma-write will not trigger any signal both remotely and locally
-      struct ibv_send_wr wr, *bad_wr = nullptr;
-      memset(&wr, 0, sizeof(wr));
-      wr.wr_id = 0;
-      wr.opcode = IBV_WR_RDMA_WRITE;
-      wr.next = nullptr;
-      wr.sg_list = &my_sge;
-      wr.num_sge = 1;
-      wr.wr.rdma.rkey = rkey;
-
-      // write to the next page-aligned address (remote_addr should already be aligned)
-      wr.wr.rdma.remote_addr = remote_addr + align_ceil(msg_buf->inline_len, pagesize_);
-
-      CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
-        << "ibv_post_send failed.";
-
-    } else {
-      CHECK_EQ(msg_buf->mrs.size(),0);
-    }
-
-    // prepare RDMA write sge list
     struct ibv_sge sge;
     sge.addr = reinterpret_cast<uint64_t>(msg_buf->inline_buf);
     sge.length = msg_buf->inline_len;
@@ -384,19 +355,51 @@ class RDMATransport : public Transport {
     RDMAWriteWithImm(msg_buf, raddr, rkey, idx);
   }
 
-  void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
-    Send(msg, msg_buf, remote_tuple);
+  void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+    CHECK_EQ(msg_buf->mrs.size(), 3);
+    auto raddr = std::get<0>(remote_tuple);
+    auto rkey = std::get<1>(remote_tuple);
+    auto idx = std::get<2>(remote_tuple);
+
+    // push request, split the meta and data into two writes
+    // further, it does not send keys and lens since these meta already carries these info 
+    struct ibv_sge my_sge;
+    my_sge.addr = reinterpret_cast<uint64_t>(msg_buf->mrs[1].first->addr);
+    my_sge.length = msg_buf->mrs[1].second;
+    my_sge.lkey = msg_buf->mrs[1].first->lkey;
+
+    // this rdma-write will not trigger any signal both remotely and locally
+    struct ibv_send_wr wr, *bad_wr = nullptr;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = 0;
+    wr.opcode = IBV_WR_RDMA_WRITE;
+    wr.next = nullptr;
+    wr.sg_list = &my_sge;
+    wr.num_sge = 1;
+    wr.wr.rdma.rkey = rkey;
+
+    // write to the next page-aligned address (remote_addr should already be aligned)
+    wr.wr.rdma.remote_addr = raddr + align_ceil(msg_buf->inline_len, pagesize_);
+
+    CHECK_EQ(ibv_post_send(endpoint_->cm_id->qp, &wr, &bad_wr), 0)
+        << "ibv_post_send failed.";
+
+    RDMAWriteWithImm(msg_buf, raddr, rkey, idx);
   }
 
   void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+    CHECK_EQ(msg_buf->mrs.size(), 0);
     Send(msg, msg_buf, remote_tuple);
   }
 
-  virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+  virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+    CHECK_EQ(msg_buf->mrs.size(), 0);
     Send(msg, msg_buf, remote_tuple);
   }
 
   virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+    CHECK_EQ(msg_buf->mrs.size(), 0);
+
     auto raddr = msg.meta.addr;
     auto rkey = msg.meta.option;
 

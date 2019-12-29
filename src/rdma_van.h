@@ -353,7 +353,7 @@ class RDMAVan : public Van {
     MessageBuffer *msg_buf = std::get<3>(addr_tuple); // local message buffer
     
     // prepare new meta and data
-    CHECK_EQ(msg_buf->inline_len, meta_len);
+    CHECK_EQ(msg_buf->inline_len, (size_t) meta_len);
     CHECK(msg_buf->inline_buf);
     msg_buf->data = msg.data; // may not need this
     PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);

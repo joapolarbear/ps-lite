@@ -486,7 +486,7 @@ class IPCTransport : public RDMATransport {
     Send(msg, msg_buf, remote_tuple);
   }
 
-  void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+  void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple, size_t lkey) {
     CHECK_EQ(msg_buf->mrs.size(), 0);
     auto addr = (void*) CHECK_NOTNULL(msg.data[1].data());
     void* shm_addr = CHECK_NOTNULL(GetSharedMemory(kShmPrefix, msg.meta.key));

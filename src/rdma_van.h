@@ -225,143 +225,6 @@ class RDMAVan : public Van {
     }
   }
 
-  void PackWorkerTensorAddress(Message &msg) {
-    // must be pull response
-    if (msg.meta.push || msg.meta.request) return;
-    
-    uint64_t key = msg.meta.key;
-    auto recver = msg.meta.recver;
-
-    std::lock_guard<std::mutex> lock(info_mu_);
-    CHECK_NE(tensor_info_map_.find(key), tensor_info_map_.end())
-        << "key=" << key << " not inited in tensor_info_map_";
-    CHECK_NE(tensor_info_map_[key].find(recver), tensor_info_map_[key].end())
-        << "key=" << key << ", recver=" << recver << " not inited in tensor_info_map_[key]";
-    msg.meta.val_len = std::get<0>(tensor_info_map_[key][recver]);
-    msg.meta.addr = std::get<1>(tensor_info_map_[key][recver]);
-    msg.meta.option = std::get<2>(tensor_info_map_[key][recver]);
-  }
-
-  void StoreWorkerTensorAddress(Message *msg) {
-    auto key = msg->meta.key;
-    auto len = msg->meta.val_len;
-    auto addr = msg->meta.addr;
-    auto rkey = msg->meta.option;
-    auto sender = msg->meta.sender;
-
-    std::lock_guard<std::mutex> lock(info_mu_);
-    if (tensor_info_map_.find(key) == tensor_info_map_.end()
-          || tensor_info_map_[key].find(sender) == tensor_info_map_[key].end()) {
-      tensor_info_map_[key][sender] = std::make_tuple(len, addr, rkey);
-    } else {
-      CHECK_EQ(len, std::get<0>(tensor_info_map_[key][sender]));
-      CHECK_EQ(addr, std::get<1>(tensor_info_map_[key][sender]));
-      CHECK_EQ(rkey, std::get<2>(tensor_info_map_[key][sender]));
-    }
-  }
-
-  bool HasRemoteInfo(Message& msg, uint64_t key, bool is_push, int recver) {
-    std::lock_guard<std::mutex> lk(addr_mu_);
-    if (is_push && (push_addr_.find(key) != push_addr_.end()) 
-        && (push_addr_[key].find(recver) != push_addr_[key].end())) {
-      return true;
-    }
-    if (!is_push && (pull_addr_.find(key) != pull_addr_.end()) 
-        && (pull_addr_[key].find(recver) != pull_addr_[key].end())) {
-      return true;
-    }
-
-    return false;
-  }
-
-  void StoreMsgBuf(MessageBuffer *msg_buf, uint64_t key, bool is_push, int recver) {
-    std::lock_guard<std::mutex> lk(addr_mu_);
-    CHECK_EQ(msgbuf_cache_.find(msg_buf), msgbuf_cache_.end());
-    msgbuf_cache_[msg_buf] = std::make_tuple(key, is_push, recver);
-  }
-  
-  void StoreRemoteAndLocalInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
-    std::lock_guard<std::mutex> lk(addr_mu_);
-
-    CHECK_NE(msgbuf_cache_.find(msg_buf), msgbuf_cache_.end());
-    
-    auto key = std::get<0>(msgbuf_cache_[msg_buf]);
-    auto is_push = std::get<1>(msgbuf_cache_[msg_buf]);
-    auto recver = std::get<2>(msgbuf_cache_[msg_buf]);
-
-    auto t = std::make_tuple(remote_addr, rkey, idx, msg_buf);
-    if (is_push) {
-      push_addr_[key][recver] = t;
-    } else {
-      pull_addr_[key][recver] = t;
-    }
-  }
-
-  RemoteTuple GetRemoteAndLocalInfo(uint64_t key, bool is_push, int recver) {
-    std::lock_guard<std::mutex> lk(addr_mu_);
-    return (is_push ? push_addr_[key][recver] : pull_addr_[key][recver]);
-  }
-
-  MessageBuffer* PrepareNewMsgBuf(Message& msg) {
-    MessageBuffer *msg_buf = new MessageBuffer();
-    auto meta_len = GetPackMetaLen(msg.meta);
-    msg_buf->inline_len = meta_len;
-    msg_buf->inline_buf = mem_allocator_->Alloc(meta_len);
-    msg_buf->data = msg.data;
-    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
-    return msg_buf;
-  }
-
-  void RegisterMemory(Message &msg) {
-    for (auto& sa : msg.data) {
-      if (sa.size() == 0) continue;
-      std::lock_guard<std::mutex> lock(map_mu_);
-      if (mem_mr_.find(sa.data()) == mem_mr_.end()) {
-        struct ibv_mr *temp_mr;
-        LOG(INFO) << "ibv_mr register size=" << sa.size()
-            << "\t key=" << DecodeKey(msg.data[0]) 
-            << "\t " << (msg.meta.push ? "push" : "pull")
-            << " " << (msg.meta.request ? "request" : "response");
-
-        CHECK (temp_mr = ibv_reg_mr(mem_allocator_->GetPD(), sa.data(), sa.size(),
-            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
-            << "Failed to register the memory region: " << strerror(errno)
-            << ", sa.size()=" << sa.size();
-        mem_mr_[sa.data()] = temp_mr;
-      }
-    }
-  }
-
-  void PrepareData(Message &msg, MessageBuffer *msg_buf) {
-    if (!(msg.meta.push && msg.meta.request)) return; // only push request
-    for (auto &sa : msg_buf->data) {
-      if (sa.size() == 0) continue;
-      std::lock_guard<std::mutex> lock(map_mu_);
-      auto it = mem_mr_.find(sa.data());
-      MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
-      CHECK(ptr.get()) << strerror(errno);
-      msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
-    }
-  }
-
-  void AddMeta(Message &msg) {
-    if (msg.meta.request) {
-      msg.meta.key = DecodeKey(msg.data[0]);
-    }
-    if (msg.meta.push && msg.meta.request) { 
-      // push request
-      CHECK_EQ(msg.data.size(), 3) << msg.data.size();
-
-      std::lock_guard<std::mutex> lock(map_mu_);
-      CHECK_NE(mem_mr_.find(msg.data[1].data()), mem_mr_.end());
-
-      auto& vals = msg.data[1];
-      msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
-      msg.meta.val_len = vals.size();
-      msg.meta.option = mem_mr_[vals.data()]->rkey;
-    }
-  }
-
   int SendMsg(Message &msg) override {
     int remote_id = msg.meta.recver;
     CHECK_NE(remote_id, Meta::kEmpty);
@@ -386,7 +249,7 @@ class RDMAVan : public Van {
     // start rendezvous if no remote info
     if (!IsValidPushpull(msg)) { 
       MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);
-      StoreMsgBuf(msg_buf, 0, 0, -1);
+      StoreMsgBuf(msg_buf, msg);
       trans->SendRendezvousBegin(msg, msg_buf);
       return total_len;
 
@@ -395,7 +258,7 @@ class RDMAVan : public Van {
       auto key = msg.meta.key;
       if (!HasRemoteInfo(msg, key, is_push, remote_id)) {
         MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);
-        StoreMsgBuf(msg_buf, key, is_push, remote_id);
+        StoreMsgBuf(msg_buf, msg);
         PrepareData(msg, msg_buf);
         trans->SendRendezvousBegin(msg, msg_buf);
         return total_len;
@@ -482,6 +345,151 @@ class RDMAVan : public Van {
   }
 
  private:
+
+  void PackWorkerTensorAddress(Message &msg) {
+    // must be pull response
+    if (msg.meta.push || msg.meta.request) return;
+    
+    uint64_t key = msg.meta.key;
+    auto recver = msg.meta.recver;
+
+    std::lock_guard<std::mutex> lock(info_mu_);
+    CHECK_NE(tensor_info_map_.find(key), tensor_info_map_.end());
+    CHECK_NE(tensor_info_map_[key].find(recver), tensor_info_map_[key].end());
+    msg.meta.val_len = std::get<0>(tensor_info_map_[key][recver]);
+    msg.meta.addr = std::get<1>(tensor_info_map_[key][recver]);
+    msg.meta.option = std::get<2>(tensor_info_map_[key][recver]);
+  }
+
+  void StoreWorkerTensorAddress(Message *msg) {
+    auto key = msg->meta.key;
+    auto len = msg->meta.val_len;
+    auto addr = msg->meta.addr;
+    auto rkey = msg->meta.option;
+    auto sender = msg->meta.sender;
+
+    std::lock_guard<std::mutex> lock(info_mu_);
+    if (tensor_info_map_.find(key) == tensor_info_map_.end()
+          || tensor_info_map_[key].find(sender) == tensor_info_map_[key].end()) {
+      tensor_info_map_[key][sender] = std::make_tuple(len, addr, rkey);
+    } else {
+      CHECK_EQ(len, std::get<0>(tensor_info_map_[key][sender]));
+      CHECK_EQ(addr, std::get<1>(tensor_info_map_[key][sender]));
+      CHECK_EQ(rkey, std::get<2>(tensor_info_map_[key][sender]));
+    }
+  }
+
+  bool HasRemoteInfo(Message& msg, uint64_t key, bool is_push, int recver) {
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    if (is_push && (push_addr_.find(key) != push_addr_.end()) 
+        && (push_addr_[key].find(recver) != push_addr_[key].end())) {
+      return true;
+    }
+    if (!is_push && (pull_addr_.find(key) != pull_addr_.end()) 
+        && (pull_addr_[key].find(recver) != pull_addr_[key].end())) {
+      return true;
+    }
+
+    return false;
+  }
+
+  void StoreMsgBuf(MessageBuffer *msg_buf, Message& msg) {
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    CHECK_EQ(msgbuf_cache_.find(msg_buf), msgbuf_cache_.end());
+    msgbuf_cache_[msg_buf] = msg;
+  }  
+  
+  Message* GetFirstMsg(MessageBuffer *msg_buf) {
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    CHECK_NE(msgbuf_cache_.find(msg_buf), msgbuf_cache_.end());
+    return &msgbuf_cache_[msg_buf];
+  }  
+
+  void ReleaseFirstMsg(MessageBuffer *msg_buf) {
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    CHECK_NE(msgbuf_cache_.find(msg_buf), msgbuf_cache_.end());
+    msgbuf_cache_.erase(msg_buf);
+  }  
+  
+  void StoreRemoteAndLocalInfo(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
+    std::lock_guard<std::mutex> lk(addr_mu_);
+
+    CHECK_NE(msgbuf_cache_.find(msg_buf), msgbuf_cache_.end());
+
+    auto& msg = msgbuf_cache_[msg_buf];
+    
+    auto key = msg.meta.key;
+    auto is_push = msg.meta.push;
+    auto recver = msg.meta.recver;
+
+    auto t = std::make_tuple(remote_addr, rkey, idx, msg_buf);
+    if (is_push) {
+      push_addr_[key][recver] = t;
+    } else {
+      pull_addr_[key][recver] = t;
+    }
+  }
+
+  RemoteTuple GetRemoteAndLocalInfo(uint64_t key, bool is_push, int recver) {
+    std::lock_guard<std::mutex> lk(addr_mu_);
+    return (is_push ? push_addr_[key][recver] : pull_addr_[key][recver]);
+  }
+
+  MessageBuffer* PrepareNewMsgBuf(Message& msg) {
+    MessageBuffer *msg_buf = new MessageBuffer();
+    auto meta_len = GetPackMetaLen(msg.meta);
+    msg_buf->inline_len = meta_len;
+    msg_buf->inline_buf = mem_allocator_->Alloc(meta_len);
+    msg_buf->data = msg.data;
+    PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
+    return msg_buf;
+  }
+
+  void RegisterMemory(Message &msg) {
+    for (auto& sa : msg.data) {
+      if (sa.size() == 0) continue;
+      std::lock_guard<std::mutex> lock(map_mu_);
+      if (mem_mr_.find(sa.data()) == mem_mr_.end()) {
+        struct ibv_mr *temp_mr;
+        CHECK (temp_mr = ibv_reg_mr(mem_allocator_->GetPD(), sa.data(), sa.size(),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
+            << "Failed to register the memory region: " << strerror(errno)
+            << ", sa.size()=" << sa.size();
+        mem_mr_[sa.data()] = temp_mr;
+      }
+    }
+  }
+
+  void PrepareData(Message &msg, MessageBuffer *msg_buf) {
+    if (!(msg.meta.push && msg.meta.request)) return; // only push request
+    for (auto &sa : msg_buf->data) {
+      if (sa.size() == 0) continue;
+      std::lock_guard<std::mutex> lock(map_mu_);
+      auto it = mem_mr_.find(sa.data());
+      MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
+      CHECK(ptr.get()) << strerror(errno);
+      msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
+    }
+  }
+
+  void AddMeta(Message &msg) {
+    if (msg.meta.request) {
+      msg.meta.key = DecodeKey(msg.data[0]);
+    }
+    if (msg.meta.push && msg.meta.request) { 
+      // push request
+      CHECK_EQ(msg.data.size(), 3) << msg.data.size();
+
+      std::lock_guard<std::mutex> lock(map_mu_);
+      CHECK_NE(mem_mr_.find(msg.data[1].data()), mem_mr_.end());
+
+      auto& vals = msg.data[1];
+      msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
+      msg.meta.val_len = vals.size();
+      msg.meta.option = mem_mr_[vals.data()]->rkey;
+    }
+  }
+
   void InitContext(struct ibv_context *context) {
     context_ = context;
     CHECK(context_) << "ibv_context* empty";
@@ -561,7 +569,6 @@ class RDMAVan : public Van {
               trans->SendRendezvousReply(req, addr_pool_);
               
             } else if (imm == kRendezvousReply) {
-              auto trans = CHECK_NOTNULL(endpoint->GetTransport());
               RendezvousReply *resp =
                   reinterpret_cast<RendezvousReply *>(mr->addr);
               uint64_t remote_addr = resp->addr;
@@ -575,7 +582,36 @@ class RDMAVan : public Van {
               // Before RDMA write, store the remote info so that 
               // subsequent write does not need repeated rendezvous 
               StoreRemoteAndLocalInfo(msg_buf, remote_addr, rkey, idx);
-              trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
+
+              Message *msg = GetFirstMsg(msg_buf);
+
+              auto addr_tuple = GetRemoteAndLocalInfo(msg->meta.key, msg->meta.push, msg->meta.recver);
+
+              auto trans = CHECK_NOTNULL(endpoint->GetTransport());
+              if (!IsValidPushpull(*msg)) {
+                // control message
+                trans->RDMAWriteWithImm(msg_buf, remote_addr, rkey, idx);
+              } else if (msg->meta.push && msg->meta.request) { 
+                // worker, push request
+                trans->SendPushRequest(*msg, msg_buf, addr_tuple);
+              } else if (msg->meta.push && !msg->meta.request) { 
+                // server, push response
+                trans->SendPushResponse(*msg, msg_buf, addr_tuple);
+              } else if (!msg->meta.push && msg->meta.request) { 
+                // worker, pull request
+                trans->SendPullRequest(*msg, msg_buf, addr_tuple);
+              } else if (!msg->meta.push && !msg->meta.request) { 
+                // server, pull response
+                map_mu_.lock();
+                auto temp_mr = mem_mr_.find(msg_buf->data[1].data());
+                CHECK_NE(temp_mr, mem_mr_.end());
+                map_mu_.unlock();
+                trans->SendPullResponse(*msg, msg_buf, addr_tuple, temp_mr->second->lkey);
+              }
+
+              // release the msg_buf from msgbuf_cache_
+              ReleaseFirstMsg(msg_buf);
+
             } else {
               CHECK(0);
             }
@@ -818,7 +854,7 @@ class RDMAVan : public Van {
   // <key, recver>, (<remote_addr, rkey, idx, local_addr>)
   std::unordered_map<uint64_t, RemoteAndLocalAddress> push_addr_; 
   std::unordered_map<uint64_t, RemoteAndLocalAddress> pull_addr_; 
-  std::unordered_map<MessageBuffer*, std::tuple<uint64_t, bool, int> > msgbuf_cache_; // msg_buf, <key, is_push, recver>
+  std::unordered_map<MessageBuffer*, Message> msgbuf_cache_; // msg_buf, msg
 
   std::mutex map_mu_;
   std::unordered_map<char*, struct ibv_mr*> mem_mr_; // (memory address, ibv_mr) 

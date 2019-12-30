@@ -78,6 +78,8 @@ class RDMAVan : public Van {
     CHECK(!ibv_destroy_comp_channel(comp_event_channel_))
         << "Failed to destroy channel";
 
+    for (auto& it : mem_mr_) ibv_dereg_mr(it.second);
+
     // TODO: ibv_dealloc_pd sometimes complains resource busy, need to fix this
     // CHECK(!ibv_dealloc_pd(pd_)) << "Failed to deallocate PD: " <<
     // strerror(errno);
@@ -310,6 +312,56 @@ class RDMAVan : public Van {
     return msg_buf;
   }
 
+  void RegisterMemory(Message &msg) {
+    for (auto& sa : msg.data) {
+      if (sa.size() == 0) continue;
+      std::lock_guard<std::mutex> lock(map_mu_);
+      if (mem_mr_.find(sa.data()) == mem_mr_.end()) {
+        struct ibv_mr *temp_mr;
+        LOG(INFO) << "ibv_mr register size=" << sa.size()
+            << "\t key=" << DecodeKey(msg.data[0]) 
+            << "\t " << (msg.meta.push ? "push" : "pull")
+            << " " << (msg.meta.request ? "request" : "response");
+
+        CHECK (temp_mr = ibv_reg_mr(mem_allocator_->GetPD(), sa.data(), sa.size(),
+            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
+            << "Failed to register the memory region: " << strerror(errno)
+            << ", sa.size()=" << sa.size();
+        mem_mr_[sa.data()] = temp_mr;
+      }
+    }
+  }
+
+  void PrepareData(Message &msg, MessageBuffer *msg_buf) {
+    if (!(msg.meta.push && msg.meta.request)) return; // only push request
+    for (auto &sa : msg_buf->data) {
+      if (sa.size() == 0) continue;
+      std::lock_guard<std::mutex> lock(map_mu_);
+      auto it = mem_mr_.find(sa.data());
+      MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
+      CHECK(ptr.get()) << strerror(errno);
+      msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
+    }
+  }
+
+  void AddMeta(Message &msg) {
+    if (msg.meta.request) {
+      msg.meta.key = DecodeKey(msg.data[0]);
+    }
+    if (msg.meta.push && msg.meta.request) { 
+      // push request
+      CHECK_EQ(msg.data.size(), 3) << msg.data.size();
+
+      std::lock_guard<std::mutex> lock(map_mu_);
+      CHECK_NE(mem_mr_.find(msg.data[1].data()), mem_mr_.end());
+
+      auto& vals = msg.data[1];
+      msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
+      msg.meta.val_len = vals.size();
+      msg.meta.option = mem_mr_[vals.data()]->rkey;
+    }
+  }
+
   int SendMsg(Message &msg) override {
     int remote_id = msg.meta.recver;
     CHECK_NE(remote_id, Meta::kEmpty);
@@ -321,14 +373,15 @@ class RDMAVan : public Van {
     size_t total_len = meta_len + data_len;
     CHECK(meta_len);
 
-    auto trans = CHECK_NOTNULL(endpoint->GetTransport());
-    trans->RegisterMemory(msg);
+    RegisterMemory(msg);
 
     // pack meta info
     if (IsValidPushpull(msg)) {
-      trans->AddMeta(msg);
+      AddMeta(msg);
       PackWorkerTensorAddress(msg);
     }
+
+    auto trans = CHECK_NOTNULL(endpoint->GetTransport());
 
     // start rendezvous if no remote info
     if (!IsValidPushpull(msg)) { 
@@ -343,7 +396,7 @@ class RDMAVan : public Van {
       if (!HasRemoteInfo(msg, key, is_push, remote_id)) {
         MessageBuffer *msg_buf = PrepareNewMsgBuf(msg);
         StoreMsgBuf(msg_buf, key, is_push, remote_id);
-        trans->PrepareData(msg, msg_buf);
+        PrepareData(msg, msg_buf);
         trans->SendRendezvousBegin(msg, msg_buf);
         return total_len;
       } 
@@ -370,7 +423,11 @@ class RDMAVan : public Van {
       trans->SendPullRequest(msg, msg_buf, addr_tuple);
     } else if (!msg.meta.push && !msg.meta.request) { 
       // server, pull response
-      trans->SendPullResponse(msg, msg_buf, addr_tuple);
+      map_mu_.lock();
+      auto temp_mr = mem_mr_.find(msg_buf->data[1].data());
+      CHECK_NE(temp_mr, mem_mr_.end());
+      map_mu_.unlock();
+      trans->SendPullResponse(msg, msg_buf, addr_tuple, temp_mr->second->lkey);
     } else {
       CHECK(0) << "unexpected message type";
     }
@@ -762,6 +819,9 @@ class RDMAVan : public Van {
   std::unordered_map<uint64_t, RemoteAndLocalAddress> push_addr_; 
   std::unordered_map<uint64_t, RemoteAndLocalAddress> pull_addr_; 
   std::unordered_map<MessageBuffer*, std::tuple<uint64_t, bool, int> > msgbuf_cache_; // msg_buf, <key, is_push, recver>
+
+  std::mutex map_mu_;
+  std::unordered_map<char*, struct ibv_mr*> mem_mr_; // (memory address, ibv_mr) 
 
 };  // class RDMAVan
 

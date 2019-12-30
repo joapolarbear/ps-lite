@@ -165,15 +165,11 @@ class Transport {
   virtual int RecvPushResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
   virtual int RecvPullResponse(Message *msg, BufferContext *buffer_ctx, int meta_len) = 0;
 
-  virtual void AddMeta(Message &msg) = 0;
-  virtual void RegisterMemory(Message &msg) = 0;
-  virtual void PrepareData(Message &msg, MessageBuffer *msg_buf) = 0;
-
   virtual void Send(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
   virtual void SendPullRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
   virtual void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
   virtual void SendPushResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple)  = 0;
-  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) = 0;
+  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple, size_t lkey) = 0;
   virtual void SendRendezvousBegin(Message &msg, MessageBuffer *msg_buf) = 0;
   virtual void SendRendezvousReply(RendezvousStart *req, AddressPool<BufferContext> &pool) = 0;
 
@@ -194,36 +190,7 @@ class RDMATransport : public Transport {
     is_server_ = (role=="server");
   };
 
-  ~RDMATransport() {
-    for (auto& it : mem_mr_map_) ibv_dereg_mr(it.second);
-  };
-
-  void RegisterMemory(Message &msg) {
-    for (auto& sa : msg.data) {
-      if (sa.size() == 0) continue;
-      std::lock_guard<std::mutex> lock(map_mu_);
-      if (mem_mr_map_.find(sa.data()) == mem_mr_map_.end()) {
-        struct ibv_mr *temp_mr;
-        CHECK (temp_mr = ibv_reg_mr(allocator_->GetPD(), sa.data(), sa.size(),
-            IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE))
-            << "Failed to register the memory region: " << strerror(errno)
-            << ", sa.size()=" << sa.size();
-        mem_mr_map_[sa.data()] = temp_mr;
-      }
-    }
-  }
-
-  void PrepareData(Message &msg, MessageBuffer *msg_buf) {
-    if (!(msg.meta.push && msg.meta.request)) return; // only push request
-    for (auto &sa : msg_buf->data) {
-      if (sa.size() == 0) continue;
-      std::lock_guard<std::mutex> lock(map_mu_);
-      auto it = mem_mr_map_.find(sa.data());
-      MRPtr ptr(it->second, [](struct ibv_mr *mr) {});
-      CHECK(ptr.get()) << strerror(errno);
-      msg_buf->mrs.push_back(std::make_pair(std::move(ptr), sa.size()));
-    }
-  }
+  ~RDMATransport() {};
 
   virtual void RDMAWriteWithImm(MessageBuffer *msg_buf, uint64_t remote_addr, uint32_t rkey, uint32_t idx) {
     struct ibv_sge sge;
@@ -329,24 +296,6 @@ class RDMATransport : public Transport {
         << "ibv_post_send failed.";
   }
 
-  void AddMeta(Message &msg) {
-    if (msg.meta.request) {
-      msg.meta.key = DecodeKey(msg.data[0]);
-    }
-    if (msg.meta.push && msg.meta.request) { 
-      // push request
-      CHECK_EQ(msg.data.size(), 3) << msg.data.size();
-
-      std::lock_guard<std::mutex> lock(map_mu_);
-      CHECK_NE(mem_mr_map_.find(msg.data[1].data()), mem_mr_map_.end());
-
-      auto& vals = msg.data[1];
-      msg.meta.addr = reinterpret_cast<uint64_t>(vals.data()); // vals address
-      msg.meta.val_len = vals.size();
-      msg.meta.option = mem_mr_map_[vals.data()]->rkey;
-    }
-  }
-
   void Send(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
     auto raddr = std::get<0>(remote_tuple);
     auto rkey = std::get<1>(remote_tuple);
@@ -397,21 +346,18 @@ class RDMATransport : public Transport {
     Send(msg, msg_buf, remote_tuple);
   }
 
-  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+  virtual void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple, size_t lkey) {
     CHECK_EQ(msg_buf->mrs.size(), 0);
 
     auto raddr = msg.meta.addr;
     auto rkey = msg.meta.option;
-
-    map_mu_.lock();
-    auto temp_mr = mem_mr_map_.find(msg_buf->data[1].data());
-    CHECK_NE(temp_mr, mem_mr_map_.end());
-    map_mu_.unlock();
+    auto len = msg.meta.val_len;
+    CHECK_EQ(msg.meta.val_len, msg_buf->data[1].size());
 
     struct ibv_sge sge;
     sge.addr = reinterpret_cast<uint64_t>(msg_buf->data[1].data());
-    sge.length = msg_buf->data[1].size();
-    sge.lkey = temp_mr->second->lkey;
+    sge.length = len;
+    sge.lkey = lkey;
 
     // this rdma-write will not trigger any signal both remotely and locally
     struct ibv_send_wr wr, *bad_wr = nullptr;
@@ -496,8 +442,6 @@ class RDMATransport : public Transport {
   Endpoint *endpoint_;
   MemoryAllocator *allocator_;
   bool is_server_;
-  std::mutex map_mu_;
-  std::unordered_map<char*, struct ibv_mr*> mem_mr_map_; // (memory, ibv_mr) 
 
 }; // class Transport
 

@@ -47,6 +47,11 @@ class RDMAVan : public Van {
           new std::thread(&RDMAVan::PollEvents, this));
     }
 
+    // enable logging
+    val = Environment::Get()->find("BYTEPS_PRINT_RDMA_LOG");
+    enable_log_ = val ? atoi(val) : false;
+    if (enable_log_) LOG(INFO) << "Enable RDMA logging.";
+
     start_mu_.unlock();
     Van::Start(customer_id);
   }
@@ -123,7 +128,7 @@ class RDMAVan : public Van {
   }
 
   void Connect(const Node &node) override {
-    PS_VLOG(1) << "Connecting to Node " << node.id;
+    PS_VLOG(1) << "Connecting to Node " << node.id << ", My_Node=" << my_node_.id;
     CHECK_NE(node.id, node.kEmpty);
     CHECK_NE(node.port, node.kEmpty);
     CHECK(node.hostname.size());
@@ -274,6 +279,8 @@ class RDMAVan : public Van {
     msg_buf->data = msg.data; // may not need this
     PackMeta(msg.meta, &(msg_buf->inline_buf), &meta_len);
 
+    PrintSendLog(msg, msg_buf, addr_tuple);
+
     // already know remote address, directly use RDMA-write 
     if (msg.meta.push && msg.meta.request) { 
       // worker, push request
@@ -319,6 +326,8 @@ class RDMAVan : public Van {
 
     auto trans = CHECK_NOTNULL(endpoint->GetTransport());
 
+    PrintRecvLog(msg, buffer_ctx, meta_len);
+
     if (!IsValidPushpull(*msg)) {
       return total_len;
     }
@@ -345,6 +354,84 @@ class RDMAVan : public Van {
   }
 
  private:
+
+  void PrintSendLog(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
+    if (!enable_log_) return;
+    std::lock_guard<std::mutex> lock(log_mu_);
+
+    if (!IsValidPushpull(msg)) {
+      LOG(INFO) << "Send Control Message" << std::flush;
+    } else if (msg.meta.push && msg.meta.request) { 
+      // worker, push request
+      LOG(INFO) << "Send Push Request: key=" << msg.meta.key
+          << "\t timestamp=" << msg.meta.timestamp 
+          << "\t recver=" << msg.meta.recver
+          << "\t tensor_len=" << msg_buf->mrs[1].first->lkey
+          << "\t remote_idx=" << std::get<2>(remote_tuple)
+          << "\t remote_addr=" << std::get<0>(remote_tuple) 
+          << std::flush;
+    } else if (msg.meta.push && !msg.meta.request) { 
+      // server, push response
+      LOG(INFO) << "Send Push Response: key=" << msg.meta.key
+          << "\t timestamp=" << msg.meta.timestamp 
+          << "\t recver=" << msg.meta.recver
+          << "\t remote_idx=" << std::get<2>(remote_tuple)
+          << "\t remote_addr=" << std::get<0>(remote_tuple)
+          << std::flush;
+    } else if (!msg.meta.push && msg.meta.request) { 
+      // worker, pull request
+      LOG(INFO) << "Send Pull Request: key=" << msg.meta.key
+          << "\t timestamp=" << msg.meta.timestamp 
+          << "\t recver=" << msg.meta.recver
+          << "\t remote_idx=" << std::get<2>(remote_tuple)
+          << "\t remote_addr=" << std::get<0>(remote_tuple)
+          << std::flush;
+    } else if (!msg.meta.push && !msg.meta.request) { 
+      // server, pull response
+      LOG(INFO) << "Send Pull Response: key=" << msg.meta.key
+          << "\t timestamp=" << msg.meta.timestamp 
+          << "\t recver=" << msg.meta.recver
+          << "\t tensor_len=" << msg.meta.val_len
+          << "\t idx=" << "none"
+          << "\t remote_addr=" << msg.meta.addr
+          << std::flush;
+    }
+
+  }
+
+  void PrintRecvLog(Message *msg, BufferContext *buffer_ctx, int meta_len) {
+    if (!enable_log_) return;
+    std::lock_guard<std::mutex> lock(log_mu_);
+
+    if (!IsValidPushpull(*msg)) {
+      LOG(INFO) << "Recv Control Message" << std::flush;
+    } else if (msg->meta.push && msg->meta.request) { 
+      // push request
+      LOG(INFO) << "Recv Push Request: key=" << msg->meta.key
+          << "\t timestamp=" << msg->meta.timestamp 
+          << "\t sender=" << msg->meta.sender
+          << "\t tensor_len=" << buffer_ctx->data_len[1]
+          << std::flush;
+    } else if (!msg->meta.push && msg->meta.request) { 
+      // pull request
+      LOG(INFO) << "Recv Pull Request: key=" << msg->meta.key
+          << "\t timestamp=" << msg->meta.timestamp 
+          << "\t sender=" << msg->meta.sender
+          << std::flush;
+    } else if (msg->meta.push && !msg->meta.request) { 
+      // push response
+      LOG(INFO) << "Recv Push Response: key=" << msg->meta.key
+          << "\t timestamp=" << msg->meta.timestamp 
+          << "\t sender=" << msg->meta.sender
+          << std::flush;
+    } else if (!msg->meta.push && !msg->meta.request) { 
+      // pull response
+      LOG(INFO) << "Recv Pull Response: key=" << msg->meta.key
+          << "\t timestamp=" << msg->meta.timestamp 
+          << "\t sender=" << msg->meta.sender
+          << "\t tensor_len=" << msg->meta.val_len;
+    }
+  }
 
   void PackWorkerTensorAddress(Message &msg) {
     // must be pull response
@@ -586,6 +673,8 @@ class RDMAVan : public Van {
               Message *msg = GetFirstMsg(msg_buf);
 
               auto addr_tuple = GetRemoteAndLocalInfo(msg->meta.key, msg->meta.push, msg->meta.recver);
+
+              PrintSendLog(*msg, msg_buf, addr_tuple);
 
               auto trans = CHECK_NOTNULL(endpoint->GetTransport());
               if (!IsValidPushpull(*msg)) {
@@ -858,6 +947,10 @@ class RDMAVan : public Van {
 
   std::mutex map_mu_;
   std::unordered_map<char*, struct ibv_mr*> mem_mr_; // (memory address, ibv_mr) 
+
+  // logging
+  bool enable_log_;
+  std::mutex log_mu_;
 
 };  // class RDMAVan
 

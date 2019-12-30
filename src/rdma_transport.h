@@ -352,7 +352,7 @@ class RDMATransport : public Transport {
     auto raddr = msg.meta.addr;
     auto rkey = msg.meta.option;
     auto len = msg.meta.val_len;
-    CHECK_EQ(msg.meta.val_len, msg_buf->data[1].size());
+    CHECK_EQ((size_t) msg.meta.val_len, msg_buf->data[1].size());
 
     struct ibv_sge sge;
     sge.addr = reinterpret_cast<uint64_t>(msg_buf->data[1].data());

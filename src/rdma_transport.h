@@ -481,13 +481,10 @@ class IPCTransport : public RDMATransport {
   }
 
   void SendPushRequest(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple) {
-    msg_buf->mrs.clear(); // avoid rdma-write in RDMAWriteWithImm()
-    CHECK_EQ(msg_buf->mrs.size(), 0);
     Send(msg, msg_buf, remote_tuple);
   }
 
   void SendPullResponse(Message &msg, MessageBuffer *msg_buf, RemoteTuple remote_tuple, size_t lkey) {
-    CHECK_EQ(msg_buf->mrs.size(), 0);
     auto addr = (void*) CHECK_NOTNULL(msg.data[1].data());
     void* shm_addr = CHECK_NOTNULL(GetSharedMemory(kShmPrefix, msg.meta.key));
 
@@ -504,7 +501,6 @@ class IPCTransport : public RDMATransport {
   }
 
   int RecvPushRequest(Message *msg, BufferContext *buffer_ctx, int meta_len) {
-    CHECK(msg->meta.push && msg->meta.request);
     // get data message from local shared memory
     auto key = msg->meta.key;
     auto len = msg->meta.val_len;
@@ -567,7 +563,8 @@ class IPCTransport : public RDMATransport {
     std::string shm_name(prefix);
     shm_name += std::to_string(base_key);
     int shm_fd = shm_open(shm_name.c_str(), O_RDWR, 0666);
-    CHECK_GE(shm_fd, 0) << "shm_open failed for " << shm_name;
+    CHECK_GE(shm_fd, 0) << "shm_open failed for " << shm_name
+        << ", " << strerror(errno);
 
     struct stat sb;
     CHECK_EQ(0, fstat(shm_fd, &sb)) << strerror(errno);

@@ -366,7 +366,7 @@ class RDMAVan : public Van {
       LOG(INFO) << "Send Push Request: key=" << msg.meta.key
           << "\t timestamp=" << msg.meta.timestamp 
           << "\t recver=" << msg.meta.recver
-          << "\t tensor_len=" << msg_buf->mrs[1].first->lkey
+          << "\t tensor_len=" << msg_buf->mrs[1].second
           << "\t remote_idx=" << std::get<2>(remote_tuple)
           << "\t remote_addr=" << std::get<0>(remote_tuple) 
           << std::flush;

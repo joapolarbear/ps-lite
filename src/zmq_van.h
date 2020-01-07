@@ -150,7 +150,7 @@ class ZMQVan : public Van {
       std::string my_id = "ps" + std::to_string(my_node_.id);
       zmq_setsockopt(sender, ZMQ_IDENTITY, my_id.data(), my_id.size());
       zmq_setsockopt(sender, ZMQ_RATE, &_zmq_rate, sizeof(int64_t));
-      std::cout << "\n!!!!!ZMQ_RATE: " << _zmq_rate << "!!!\n" << std::flush();
+      std::cout << "\n!!!!!ZMQ_RATE: " << _zmq_rate << "!!!\n" << std::flush;
       std::lock_guard<std::mutex> lk(mu_);
       if (is_worker_ && (senders_.find(id)==senders_.end())) {
         auto t = new std::thread(&ZMQVan::CallZmqRecvThread, this, (void*) sender);

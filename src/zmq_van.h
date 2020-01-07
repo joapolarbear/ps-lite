@@ -12,6 +12,7 @@
 #include <cmath>
 #include <atomic>
 #include <tuple>
+#include <stdlib.h>     /* getenv */
 #include "ps/internal/threadsafe_queue.h"
 #include "ps/internal/van.h"
 #if _MSC_VER
@@ -98,6 +99,7 @@ class ZMQVan : public Van {
         << zmq_strerror(errno);
     CHECK(receiver_ != NULL)
         << "create receiver socket failed: " << zmq_strerror(errno);
+    zmq_setsockopt(receiver_, ZMQ_RATE, &_zmq_rate, sizeof(int64_t));
     int local = GetEnv("DMLC_LOCAL", 0);
     std::string hostname = node.hostname.empty() ? "*" : node.hostname;
     int use_kubernetes = GetEnv("DMLC_USE_KUBERNETES", 0);
@@ -147,6 +149,7 @@ class ZMQVan : public Van {
     if (my_node_.id != Node::kEmpty) {
       std::string my_id = "ps" + std::to_string(my_node_.id);
       zmq_setsockopt(sender, ZMQ_IDENTITY, my_id.data(), my_id.size());
+      zmq_setsockopt(sender, ZMQ_RATE, &_zmq_rate, sizeof(int64_t));
       std::lock_guard<std::mutex> lk(mu_);
       if (is_worker_ && (senders_.find(id)==senders_.end())) {
         auto t = new std::thread(&ZMQVan::CallZmqRecvThread, this, (void*) sender);
@@ -415,6 +418,8 @@ class ZMQVan : public Van {
   std::atomic<bool> should_stop_{false};
 
   std::vector<std::thread*> thread_list_;
+  
+  int64_t _zmq_rate = getenv("BYTEPS_TRACE_ZMQ_RATE") ? getenv("BYTEPS_TRACE_ZMQ_RATE") : 100;
 
 };
 }  // namespace ps

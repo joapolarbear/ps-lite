@@ -419,7 +419,7 @@ class ZMQVan : public Van {
 
   std::vector<std::thread*> thread_list_;
   
-  int64_t _zmq_rate = getenv("BYTEPS_TRACE_ZMQ_RATE") ? getenv("BYTEPS_TRACE_ZMQ_RATE") : 100;
+  int64_t _zmq_rate = getenv("BYTEPS_TRACE_ZMQ_RATE") ? atoi(getenv("BYTEPS_TRACE_ZMQ_RATE")) : 100;
 
 };
 }  // namespace ps
